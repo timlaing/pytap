@@ -9,10 +9,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CONF_SERIAL_PORT, DOMAIN
 from .coordinator import PyTapDataUpdateCoordinator
 
-TO_REDACT = {CONF_HOST}
+TO_REDACT = {CONF_HOST, CONF_SERIAL_PORT, "title"}
 
 
 async def async_get_config_entry_diagnostics(

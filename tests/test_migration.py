@@ -15,6 +15,7 @@ from custom_components.pytap import (
     async_migrate_entry,
 )
 from custom_components.pytap.const import (
+    CONF_CONNECTION_TYPE,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -22,6 +23,7 @@ from custom_components.pytap.const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    CONNECTION_TCP,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
@@ -67,9 +69,7 @@ def _make_entry(
 class TestLegacyEntityCleanup:
     """Test _async_cleanup_legacy_entities removes old unique IDs."""
 
-    async def test_removes_old_voltage_and_current_entities(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_removes_old_voltage_and_current_entities(self, hass: HomeAssistant) -> None:
         """Legacy 'voltage' and 'current' entities should be removed."""
         entry = _make_entry(hass)
         ent_reg = er.async_get(hass)
@@ -85,30 +85,15 @@ class TestLegacyEntityCleanup:
                 )
 
         # Verify they exist before cleanup
-        assert (
-            ent_reg.async_get_entity_id(
-                "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_voltage"
-            )
-            is not None
-        )
-        assert (
-            ent_reg.async_get_entity_id(
-                "sensor", DOMAIN, f"{DOMAIN}_C-2345678D_current"
-            )
-            is not None
-        )
+        assert ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_voltage") is not None
+        assert ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_C-2345678D_current") is not None
 
         await _async_cleanup_legacy_entities(hass, entry)
 
         # All legacy entities should be gone
         for barcode in ("A-1234567B", "C-2345678D"):
             for old_key in ("voltage", "current"):
-                assert (
-                    ent_reg.async_get_entity_id(
-                        "sensor", DOMAIN, f"{DOMAIN}_{barcode}_{old_key}"
-                    )
-                    is None
-                )
+                assert ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{barcode}_{old_key}") is None
 
     async def test_does_not_touch_new_entities(self, hass: HomeAssistant) -> None:
         """New voltage_in/voltage_out/current_in/current_out should not be removed."""
@@ -129,12 +114,7 @@ class TestLegacyEntityCleanup:
 
         # All new entities should still exist
         for key in new_keys:
-            assert (
-                ent_reg.async_get_entity_id(
-                    "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_{key}"
-                )
-                is not None
-            )
+            assert ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_{key}") is not None
 
     async def test_no_op_when_no_legacy_entities(self, hass: HomeAssistant) -> None:
         """Should not error when no legacy entities exist."""
@@ -249,9 +229,7 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
 
-    async def test_migrate_v3_to_v4_preserves_peak_power(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_migrate_v3_to_v4_preserves_peak_power(self, hass: HomeAssistant) -> None:
         """Existing peak power values should not be overwritten."""
         entry = _make_entry(
             hass,
@@ -299,9 +277,7 @@ class TestConfigEntryMigration:
         assert entry.data[CONF_MODULES][0][CONF_MODULE_PEAK_POWER] == 400
         assert entry.data[CONF_MODULES][1][CONF_MODULE_PEAK_POWER] == DEFAULT_PEAK_POWER
 
-    async def test_migrate_v4_to_v5_adds_live_reporting(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_migrate_v4_to_v5_adds_live_reporting(self, hass: HomeAssistant) -> None:
         """v4 → v5: adds live_reporting with default True."""
         entry = _make_entry(
             hass,
@@ -322,9 +298,7 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_LIVE_REPORTING] is DEFAULT_LIVE_REPORTING
 
-    async def test_migrate_v4_to_v5_preserves_existing_live_reporting(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_migrate_v4_to_v5_preserves_existing_live_reporting(self, hass: HomeAssistant) -> None:
         """v4 → v5: if live_reporting is already in data, preserve it."""
         entry = _make_entry(
             hass,
@@ -332,9 +306,7 @@ class TestConfigEntryMigration:
             modules=[],
         )
         # Simulate a user who manually set it somehow
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_LIVE_REPORTING: False}
-        )
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_LIVE_REPORTING: False})
 
         result = await async_migrate_entry(hass, entry)
 
@@ -342,14 +314,10 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_LIVE_REPORTING] is False
 
-    async def test_migrate_v4_to_v5_clamps_small_write_interval(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_migrate_v4_to_v5_clamps_small_write_interval(self, hass: HomeAssistant) -> None:
         """v4 → v5: a stale sub-minimum write_interval is clamped into range."""
         entry = _make_entry(hass, version=4, modules=[])
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_WRITE_INTERVAL: 1}
-        )
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_WRITE_INTERVAL: 1})
 
         result = await async_migrate_entry(hass, entry)
 
@@ -357,17 +325,31 @@ class TestConfigEntryMigration:
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_WRITE_INTERVAL] == MIN_WRITE_INTERVAL
 
-    async def test_migrate_v4_to_v5_preserves_valid_write_interval(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_migrate_v4_to_v5_preserves_valid_write_interval(self, hass: HomeAssistant) -> None:
         """v4 → v5: an in-range write_interval is left unchanged."""
         entry = _make_entry(hass, version=4, modules=[])
-        hass.config_entries.async_update_entry(
-            entry, data={**entry.data, CONF_WRITE_INTERVAL: 60}
-        )
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_WRITE_INTERVAL: 60})
 
         result = await async_migrate_entry(hass, entry)
 
         assert result is True
         assert entry.version == CONFIG_ENTRY_VERSION
         assert entry.data[CONF_WRITE_INTERVAL] == 60
+
+
+async def test_v5_migration_preserves_connection_and_identity(hass: HomeAssistant) -> None:
+    """Only the transport discriminator is added to existing TCP entries."""
+    entry = _make_entry(hass, version=5)
+    old_data = dict(entry.data)
+    old_entry_id, old_unique_id = entry.entry_id, entry.unique_id
+    assert await async_migrate_entry(hass, entry)
+    assert entry.version == 6
+    assert entry.data == {**old_data, CONF_CONNECTION_TYPE: CONNECTION_TCP}
+    assert entry.entry_id == old_entry_id
+    assert entry.unique_id == old_unique_id
+
+
+async def test_future_version_is_not_downgraded(hass: HomeAssistant) -> None:
+    entry = _make_entry(hass, version=7)
+    assert not await async_migrate_entry(hass, entry)
+    assert entry.version == 7

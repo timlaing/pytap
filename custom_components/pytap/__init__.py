@@ -12,15 +12,18 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 
 from .const import (
+    CONF_CONNECTION_TYPE,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    CONNECTION_TCP,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_STRING_NAME,
@@ -39,7 +42,8 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 # Bumped from 2 → 3 when module string labels became mandatory.
 # Bumped from 3 → 4 when module peak_power became mandatory in config.
 # Bumped from 4 → 5 when live_reporting toggle was added.
-CONFIG_ENTRY_VERSION = 5
+# Bumped from 5 → 6 when serial/proxy connections were added.
+CONFIG_ENTRY_VERSION = 6
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -60,6 +64,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     5. Store the coordinator and forward platform setup.
     """
     hass.data.setdefault(DOMAIN, {})
+    # A timed-out stop must not allow a new coordinator to claim the same port.
+    if previous := hass.data[DOMAIN].get(entry.entry_id):
+        if not await previous.async_stop_listener():
+            raise ConfigEntryNotReady("Previous PyTap listener is still stopping")
 
     # --- Legacy entity migration (voltage/current → voltage_in/out, current_in/out) ---
     await _async_cleanup_legacy_entities(hass, entry)
@@ -97,9 +105,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     2. Stop the coordinator's background listener.
     3. Remove coordinator from hass.data.
     """
+    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    if not await coordinator.async_stop_listener():
+        return False
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        await coordinator.async_stop_listener()
+        hass.data[DOMAIN].pop(entry.entry_id)
+    else:
+        await coordinator.async_start_listener()
 
     return unload_ok
 
@@ -111,7 +123,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     v2 → v3: module string labels are mandatory.
     v3 → v4: module peak power is added with default value.
     v4 → v5: live_reporting toggle added (default True).
+    v5 → v6: existing connections explicitly marked as TCP.
     """
+    if entry.version > CONFIG_ENTRY_VERSION:
+        return False
     if entry.version == 1:
         _LOGGER.info(
             "Migrating PyTap config entry %s from version 1 to 2",
@@ -175,17 +190,20 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 interval = int(new_data[CONF_WRITE_INTERVAL])
             except (TypeError, ValueError):
                 interval = DEFAULT_WRITE_INTERVAL
-            new_data[CONF_WRITE_INTERVAL] = max(
-                MIN_WRITE_INTERVAL, min(MAX_WRITE_INTERVAL, interval)
-            )
+            new_data[CONF_WRITE_INTERVAL] = max(MIN_WRITE_INTERVAL, min(MAX_WRITE_INTERVAL, interval))
         hass.config_entries.async_update_entry(entry, data=new_data, version=5)
+
+    if entry.version == 5:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_CONNECTION_TYPE: CONNECTION_TCP},
+            version=6,
+        )
 
     return True
 
 
-async def _async_cleanup_legacy_entities(
-    hass: HomeAssistant, entry: ConfigEntry
-) -> None:
+async def _async_cleanup_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove legacy entity registry entries left over from the voltage/current rename.
 
     Before v0.2.0, sensors used unique IDs like ``pytap_BARCODE_voltage`` and

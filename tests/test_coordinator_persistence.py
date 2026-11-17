@@ -218,9 +218,7 @@ class TestLoadCoordinatorState:
         assert acc.readings_today == 17
         assert acc.last_power_w == 250.0
 
-    async def test_load_resets_daily_energy_on_new_day(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_load_resets_daily_energy_on_new_day(self, hass: HomeAssistant) -> None:
         """Daily energy should reset when stored reset date is not today."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -271,9 +269,7 @@ class TestLoadCoordinatorState:
         assert coordinator._discovered_barcodes == {"X-9999999Z"}
         assert coordinator._energy_state == {}
 
-    async def test_load_restores_node_snapshot_without_energy(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_load_restores_node_snapshot_without_energy(self, hass: HomeAssistant) -> None:
         """Node snapshot should restore live fields even without energy_data."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -662,6 +658,7 @@ class TestPowerReportDeferredBeforeInfra:
         """Power reports with a direct barcode should work even pre-infra."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
         coordinator._infra_received = False
 
         event = PowerReportEvent(
@@ -715,6 +712,7 @@ class TestPowerReportPerformance:
         """Power report should populate performance in node payload."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -739,6 +737,7 @@ class TestPowerReportPerformance:
         """Performance should be power/peak_power*100 rounded to 2 decimals."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -771,6 +770,7 @@ class TestPowerReportPerformance:
             ],
         }
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
+        coordinator._schedule_save = MagicMock()
 
         event = PowerReportEvent(
             gateway_id=1,
@@ -866,9 +866,7 @@ class TestEnergyPrePopulation:
         assert node["readings_today"] == 100
         assert node["barcode"] == "A-1234567B"
 
-    async def test_prepopulated_node_has_none_for_live_fields(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_prepopulated_node_has_none_for_live_fields(self, hass: HomeAssistant) -> None:
         """Pre-populated node data should have None for fields that require live data."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -902,9 +900,7 @@ class TestEnergyPrePopulation:
         assert node["rssi"] is None
         assert node["performance"] is None
 
-    async def test_prepopulation_skips_unconfigured_barcodes(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_prepopulation_skips_unconfigured_barcodes(self, hass: HomeAssistant) -> None:
         """Only configured barcodes should be pre-populated in node data."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -939,9 +935,7 @@ class TestEnergyPrePopulation:
         assert "A-1234567B" in coordinator.data["nodes"]
         assert "UNCONFIGURED-BARCODE" not in coordinator.data["nodes"]
 
-    async def test_power_report_overwrites_prepopulated_data(
-        self, hass: HomeAssistant
-    ) -> None:
+    async def test_power_report_overwrites_prepopulated_data(self, hass: HomeAssistant) -> None:
         """A live power report should fully replace pre-populated node data."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -995,9 +989,7 @@ class TestEnergyPrePopulation:
 class TestMidnightReset:
     """Test that the midnight reset timer proactively resets daily accumulators."""
 
-    def test_perform_midnight_reset_zeros_daily_values(
-        self, hass: HomeAssistant
-    ) -> None:
+    def test_perform_midnight_reset_zeros_daily_values(self, hass: HomeAssistant) -> None:
         """Daily energy and readings should be zeroed by midnight reset."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -1038,10 +1030,9 @@ class TestMidnightReset:
 
         coordinator._schedule_save.assert_called_once()
         coordinator.async_set_updated_data.assert_called_once()
+        coordinator._midnight_reset_unsub.cancel()
 
-    def test_perform_midnight_reset_skips_already_reset(
-        self, hass: HomeAssistant
-    ) -> None:
+    def test_perform_midnight_reset_skips_already_reset(self, hass: HomeAssistant) -> None:
         """Accumulators already reset for today should not be modified again."""
         entry = _make_entry(hass)
         coordinator = PyTapDataUpdateCoordinator(hass, entry)
@@ -1067,6 +1058,7 @@ class TestMidnightReset:
 
         coordinator._schedule_save.assert_not_called()
         coordinator.async_set_updated_data.assert_not_called()
+        coordinator._midnight_reset_unsub.cancel()
 
     def test_perform_midnight_reset_reschedules(self, hass: HomeAssistant) -> None:
         """Midnight reset should reschedule itself for the next midnight."""
@@ -1078,6 +1070,7 @@ class TestMidnightReset:
         coordinator._perform_midnight_reset()
 
         assert coordinator._midnight_reset_unsub is not None
+        coordinator._midnight_reset_unsub.cancel()
 
     def test_stop_cancels_midnight_timer(self, hass: HomeAssistant) -> None:
         """Stopping the listener should cancel the midnight reset timer."""

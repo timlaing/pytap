@@ -4,16 +4,21 @@
 
 ### Added
 
-- **Configurable reporting mode** — New "Live reporting" toggle (default on) under **Configure → Change reporting settings**. When disabled, readings are cached and delivered as a time-weighted average every *reporting interval* (5–300 s, default 30), reducing CPU and recorder load on installations with many panels. Energy totals are always integrated from raw readings, so only the instantaneous values are averaged.
+- Home Assistant ESPHome serial proxies and local serial adapters, selectable with the native serial-port picker during setup and connection changes.
+- Transport diagnostics with serial endpoints redacted, and bounded serial open/read/close operations using `serialx`.
+- **Configurable reporting mode** — New "Live reporting" toggle (default on) under **Configure → Change reporting settings**. When disabled, readings are cached and delivered as a time-weighted average every _reporting interval_ (5–300 s, default 30), reducing CPU and recorder load on installations with many panels. Energy totals are always integrated from raw readings, so only the instantaneous values are averaged.
 
 ### Changed
 
+- Home Assistant 2026.11+ is now required; existing TCP connections migrate automatically to config-entry version 6 without changing entity IDs or energy history.
+- Connection settings now offer TCP or serial/proxy; serial defaults to 38400 baud, 8N1, with no flow control or bus writes.
 - Reporting interval default changed from 5 to 30 seconds; allowed range tightened from 1–300 to 5–300 seconds.
 - Config entry schema bumped to version 5 (adds `live_reporting`, default `True`, via automatic migration).
 - The reporting interval is now collected on its own follow-up screen that appears only when live reporting is turned off, so the interval is never shown (effectively greyed out) while live reporting is enabled.
 
 ### Fixed
 
+- Listener shutdown now waits for the actual executor worker to release its port; a timed-out stop blocks replacement listeners rather than leaking a worker during reload.
 - Live reporting no longer buffers readings internally, preventing unbounded memory growth over time in the default mode.
 - Live reporting now publishes an immutable copy of node data to Home Assistant, avoiding rare races where consumers (sensors, diagnostics) could observe the data changing mid-read.
 - Averaged interval mode now flushes buffered readings on schedule during quiet periods (e.g. at dusk), instead of waiting for the next reading or a reconnect.
