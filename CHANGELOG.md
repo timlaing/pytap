@@ -4,12 +4,15 @@
 
 ### Added
 
+- Passive automatic optimizer discovery, enabled by default for new setups. Setup can finish before any modules are seen; sensors and aggregate membership grow dynamically as barcodes arrive.
+- Discovery status diagnostics, module metadata editing, and persistent ignore rules for explicitly removed optimizers.
 - Home Assistant ESPHome serial proxies and local serial adapters, selectable with the native serial-port picker during setup and connection changes.
 - Transport diagnostics with serial endpoints redacted, and bounded serial open/read/close operations using `serialx`.
 - **Configurable reporting mode** — New "Live reporting" toggle (default on) under **Configure → Change reporting settings**. When disabled, readings are cached and delivered as a time-weighted average every _reporting interval_ (5–300 s, default 30), reducing CPU and recorder load on installations with many panels. Energy totals are always integrated from raw readings, so only the instantaneous values are averaged.
 
 ### Changed
 
+- Config-entry version 7 preserves manual mode on existing installations. Automatically discovered modules use barcode-based names and unknown panel ratings until edited; performance is not guessed from a default rating.
 - Home Assistant 2026.11+ is now required; existing TCP connections migrate automatically to config-entry version 6 without changing entity IDs or energy history.
 - Connection settings now offer TCP or serial/proxy; serial defaults to 38400 baud, 8N1, with no flow control or bus writes.
 - Reporting interval default changed from 5 to 30 seconds; allowed range tightened from 1–300 to 5–300 seconds.
@@ -18,6 +21,8 @@
 
 ### Fixed
 
+- Finish setup in empty manual mode now shows a validation error instead of silently returning to the menu.
+- Discovery saves do not trigger reconnections, and module edits preserve discoveries arriving while the options flow is open.
 - Listener shutdown now waits for the actual executor worker to release its port; a timed-out stop blocks replacement listeners rather than leaking a worker during reload.
 - Live reporting no longer buffers readings internally, preventing unbounded memory growth over time in the default mode.
 - Live reporting now publishes an immutable copy of node data to Home Assistant, avoiding rare races where consumers (sensors, diagnostics) could observe the data changing mid-read.

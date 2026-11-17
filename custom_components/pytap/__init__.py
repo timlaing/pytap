@@ -16,7 +16,9 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 
 from .const import (
+    CONF_AUTO_DISCOVERY,
     CONF_CONNECTION_TYPE,
+    CONF_EXCLUDED_BARCODES,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_PEAK_POWER,
@@ -43,7 +45,8 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 # Bumped from 3 → 4 when module peak_power became mandatory in config.
 # Bumped from 4 → 5 when live_reporting toggle was added.
 # Bumped from 5 → 6 when serial/proxy connections were added.
-CONFIG_ENTRY_VERSION = 6
+# Bumped from 6 → 7 when automatic module discovery became configurable.
+CONFIG_ENTRY_VERSION = 7
 
 # Old unique IDs that were replaced by the _in/_out split.
 _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
@@ -124,6 +127,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     v3 → v4: module peak power is added with default value.
     v4 → v5: live_reporting toggle added (default True).
     v5 → v6: existing connections explicitly marked as TCP.
+    v6 → v7: preserve manual selection on existing entries.
     """
     if entry.version > CONFIG_ENTRY_VERSION:
         return False
@@ -198,6 +202,17 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry,
             data={**entry.data, CONF_CONNECTION_TYPE: CONNECTION_TCP},
             version=6,
+        )
+
+    if entry.version == 6:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_AUTO_DISCOVERY: entry.data.get(CONF_AUTO_DISCOVERY, False),
+                CONF_EXCLUDED_BARCODES: entry.data.get(CONF_EXCLUDED_BARCODES, []),
+            },
+            version=7,
         )
 
     return True

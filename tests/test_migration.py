@@ -15,7 +15,9 @@ from custom_components.pytap import (
     async_migrate_entry,
 )
 from custom_components.pytap.const import (
+    CONF_AUTO_DISCOVERY,
     CONF_CONNECTION_TYPE,
+    CONF_EXCLUDED_BARCODES,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -343,13 +345,18 @@ async def test_v5_migration_preserves_connection_and_identity(hass: HomeAssistan
     old_data = dict(entry.data)
     old_entry_id, old_unique_id = entry.entry_id, entry.unique_id
     assert await async_migrate_entry(hass, entry)
-    assert entry.version == 6
-    assert entry.data == {**old_data, CONF_CONNECTION_TYPE: CONNECTION_TCP}
+    assert entry.version == CONFIG_ENTRY_VERSION
+    assert entry.data == {
+        **old_data,
+        CONF_CONNECTION_TYPE: CONNECTION_TCP,
+        CONF_AUTO_DISCOVERY: False,
+        CONF_EXCLUDED_BARCODES: [],
+    }
     assert entry.entry_id == old_entry_id
     assert entry.unique_id == old_unique_id
 
 
 async def test_future_version_is_not_downgraded(hass: HomeAssistant) -> None:
-    entry = _make_entry(hass, version=7)
+    entry = _make_entry(hass, version=CONFIG_ENTRY_VERSION + 1)
     assert not await async_migrate_entry(hass, entry)
-    assert entry.version == 7
+    assert entry.version == CONFIG_ENTRY_VERSION + 1

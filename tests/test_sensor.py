@@ -131,6 +131,19 @@ def _make_mock_coordinator(hass, entry, node_data=None):
     coordinator.hass = hass
     coordinator.config_entry = entry
     coordinator.last_update_success = True
+    coordinator.modules = entry.data.get(CONF_MODULES, [])
+    coordinator.module_count = len(
+        {m.get(CONF_MODULE_BARCODE) for m in coordinator.modules if m.get(CONF_MODULE_BARCODE)}
+    )
+    coordinator.auto_discovery = False
+    coordinator.module_peak_power.side_effect = lambda barcode: next(
+        (
+            m.get(CONF_MODULE_PEAK_POWER, 455)
+            for m in coordinator.modules
+            if m.get(CONF_MODULE_BARCODE) == barcode
+        ),
+        455,
+    )
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
 
@@ -187,15 +200,11 @@ async def test_sensor_available_with_data(hass: HomeAssistant) -> None:
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     # Find the power sensor for S-1234567A (has data)
-    power_sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_power"
-    )
+    power_sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_power")
     assert power_sensor.available is True
 
     # Find a sensor for C-2345678D (no data yet)
-    power_sensor_b = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_C-2345678D_power"
-    )
+    power_sensor_b = next(e for e in entities if e.unique_id == f"{DOMAIN}_C-2345678D_power")
     assert power_sensor_b.available is False
 
 
@@ -252,9 +261,7 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    power_sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_power"
-    )
+    power_sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_power")
     device_info = power_sensor.device_info
     assert (DOMAIN, "A-1234567B") in device_info["identifiers"]
     assert device_info["manufacturer"] == "Tigo Energy"
@@ -269,9 +276,7 @@ async def test_sensor_descriptions_count() -> None:
 
 async def test_energy_sensor_descriptions() -> None:
     """Test energy sensor description metadata."""
-    description_map = {
-        description.key: description for description in SENSOR_DESCRIPTIONS
-    }
+    description_map = {description.key: description for description in SENSOR_DESCRIPTIONS}
 
     daily_energy = description_map["daily_energy"]
     assert daily_energy.native_unit_of_measurement == UnitOfEnergy.WATT_HOUR
@@ -293,9 +298,7 @@ async def test_daily_energy_last_reset(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    daily_energy_sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_daily_energy"
-    )
+    daily_energy_sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_daily_energy")
     assert daily_energy_sensor.last_reset is not None
     assert daily_energy_sensor.last_reset.isoformat().startswith("2025-01-01T00:00:00")
 
@@ -339,9 +342,7 @@ async def test_readings_today_sensor_metadata(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_readings_today"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_readings_today")
     assert sensor.entity_description.state_class == SensorStateClass.TOTAL
     assert sensor.entity_description.entity_category == EntityCategory.DIAGNOSTIC
     assert sensor.entity_description.native_unit_of_measurement is None
@@ -358,9 +359,7 @@ async def test_readings_today_value_and_last_reset(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_readings_today"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_readings_today")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
 
@@ -394,11 +393,7 @@ async def test_string_power_sums_constituents(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_power"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_power")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 550.0
@@ -415,11 +410,7 @@ async def test_installation_power_sums_all(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 550.0
@@ -450,11 +441,7 @@ async def test_string_daily_energy_sums(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_daily_energy"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_daily_energy")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 220.0
@@ -485,11 +472,7 @@ async def test_string_total_energy_sums(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_total_energy"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_total_energy")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 8600.0
@@ -507,9 +490,7 @@ async def test_installation_daily_energy_sums_all(hass: HomeAssistant) -> None:
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_daily_energy"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_daily_energy"
     )
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
@@ -528,9 +509,7 @@ async def test_installation_total_energy_sums_all(hass: HomeAssistant) -> None:
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
     )
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
@@ -548,11 +527,7 @@ async def test_aggregate_available_partial_data(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    installation = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power"
-    )
+    installation = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power")
     assert installation.available is True
 
 
@@ -571,11 +546,7 @@ async def test_aggregate_excludes_none_values(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    installation = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power"
-    )
+    installation = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power")
     installation.async_write_ha_state = lambda: None
     installation._handle_coordinator_update()
     assert installation.native_value == 300.0
@@ -592,9 +563,7 @@ async def test_performance_sensor_value(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    performance_sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance"
-    )
+    performance_sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance")
     performance_sensor.async_write_ha_state = lambda: None
     performance_sensor._handle_coordinator_update()
     assert performance_sensor.native_value == 65.76
@@ -637,11 +606,7 @@ async def test_string_performance_weighted(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_performance"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_performance")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 55.56
@@ -671,9 +636,7 @@ async def test_installation_performance_partial_data(hass: HomeAssistant) -> Non
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     installation = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_performance"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_performance"
     )
     installation.async_write_ha_state = lambda: None
     installation._handle_coordinator_update()
@@ -698,9 +661,7 @@ async def test_installation_performance_unavailable_without_data(
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     installation = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_performance"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_performance"
     )
     installation.async_write_ha_state = lambda: None
     installation._handle_coordinator_update()
@@ -725,9 +686,7 @@ async def test_performance_sensor_zero_power(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == 0.0
@@ -752,9 +711,7 @@ async def test_performance_sensor_above_100(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_performance")
     sensor.async_write_ha_state = lambda: None
     sensor._handle_coordinator_update()
     assert sensor.native_value == round((500.0 / 455) * 100.0, 2)
@@ -772,11 +729,7 @@ async def test_aggregate_extra_attributes(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    installation = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power"
-    )
+    installation = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power")
     assert installation.extra_state_attributes == {
         "optimizer_count": 2,
         "reporting_count": 1,
@@ -794,11 +747,7 @@ async def test_string_aggregate_device_info(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_power"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_string_A_power")
     device_info = sensor.device_info
     assert (DOMAIN, f"{entry.entry_id}_string_A") in device_info["identifiers"]
     assert device_info["name"] == "Tigo String A"
@@ -817,11 +766,7 @@ async def test_installation_aggregate_device_info(hass: HomeAssistant) -> None:
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power"
-    )
+    sensor = next(e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_power")
     device_info = sensor.device_info
     assert (DOMAIN, f"{entry.entry_id}_installation") in device_info["identifiers"]
     assert device_info["name"] == "Tigo Installation"
@@ -841,9 +786,7 @@ async def test_aggregate_daily_energy_last_reset(hass: HomeAssistant) -> None:
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_daily_energy"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_daily_energy"
     )
     assert sensor.last_reset is not None
     assert sensor.last_reset.hour == 0
@@ -863,9 +806,7 @@ async def test_aggregate_total_energy_no_last_reset(hass: HomeAssistant) -> None
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
     sensor = next(
-        e
-        for e in entities
-        if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+        e for e in entities if e.unique_id == f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
     )
     assert sensor.last_reset is None
 
@@ -964,9 +905,7 @@ async def test_restart_restores_snapshot_before_live_stream(
 
     ent_reg = er.async_get(hass)
 
-    power_entity_id = ent_reg.async_get_entity_id(
-        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power"
-    )
+    power_entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power")
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
@@ -1055,9 +994,7 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
 
     ent_reg = er.async_get(hass)
 
-    power_entity_id = ent_reg.async_get_entity_id(
-        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power"
-    )
+    power_entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_power")
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None

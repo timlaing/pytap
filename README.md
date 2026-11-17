@@ -37,6 +37,7 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 - **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time.
 - **Embedded parser** — The protocol parser is bundled; Home Assistant installs `serialx` for serial access automatically.
 - **Native serial selection** — Choose local adapters and ESPHome proxy ports using Home Assistant's serial-port picker.
+- **Passive module discovery** — New setups can finish with no modules. Optimizer sensors and aggregate membership are created as barcode-bearing bus data arrives, and discovered modules survive restarts.
 - **Options flow** — Add or remove optimizer modules at any time without reconfiguring.
 
 ## Sensors
@@ -137,6 +138,14 @@ Version 1.3 requires **HA 2026.11+**. Existing TCP entries migrate automatically
 
 After entering connection details, you'll see a modules menu:
 
+**Automatic discovery is enabled by default for new setups.** You can immediately click **Finish setup**, even with no modules added. PyTap starts listening and creates each optimizer's sensors as its barcode appears in a node table or power report. It does not send scan commands or wait for discovery to complete before finishing setup. The installation's diagnostic **Module discovery** sensor shows **Waiting for modules** until a module is known.
+
+Discovered modules use the name **Optimizer <barcode>**, the **Discovered** string group, and an unknown rated power (**0 Wp**). No physical string layout or panel rating is inferred from bus traffic. Power and energy readings work immediately; optimizer/group performance percentages are not calculated while the relevant panel rating is unknown. Edit the module later to enter its actual name, string, and rated Wp.
+
+Discovery is gradual and depends on gateway traffic; a quiet/offline bus or missing node table may delay it. Repeated reports do not create duplicate sensors. Discovered metadata is stored with coordinator state, so admitting modules does not repeatedly reload the connection.
+
+For manual selection, open **Module discovery settings**, disable automatic discovery, then:
+
 1. Click **"Add a module"**.
 2. Fill in the fields:
    - **String group** — Required label to group optimizers by string (e.g., `A`, `East`).
@@ -145,6 +154,8 @@ After entering connection details, you'll see a modules menu:
    - **Peak power (Wp)** — The panel's peak power rating in watts (default: 455 Wp). Used to calculate performance percentage.
 3. Repeat for each optimizer you want to monitor.
 4. Click **"Finish setup"** when done.
+
+Manual setup requires at least one module; finishing without one shows an explicit error and the add-module form. Existing installations retain manual mode after the version 7 migration, unless you enable automatic discovery in options.
 
 ### Finding Barcodes
 
@@ -163,9 +174,13 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 
 - **Change connection** — Switch between TCP and serial/proxy, or update the endpoint/baud rate. Connection changes save immediately and reload PyTap without changing module settings, entity IDs, or stored energy. The current serial port is not probed again while the listener owns it.
 - **Change reporting settings** — Toggle live reporting or set the averaged reporting interval (see [Reporting modes](#reporting-modes)).
-- **Add** new optimizer modules (if the barcode was previously seen on the bus, it resolves instantly).
-- **Remove** modules you no longer want to track.
+- **Change module discovery** — Enable/disable discovering new optimizers. Disabling discovery keeps modules already known. Enabling it also admits barcodes logged in earlier manual sessions.
+- **Edit a module** — Change its friendly name, string group, and rated panel power without changing barcode-based entity IDs or stored energy. Enter **0 Wp** if the rating is unknown.
+- **Add** new optimizer modules, or explicitly restore an ignored barcode.
+- **Remove** modules you no longer want to track. Removed barcodes are ignored by automatic discovery until you explicitly add them again.
 - **Save and close** to apply changes.
+
+Module/discovery edits are saved together on **Save and close**. Modules discovered while the options flow is open are merged into the saved catalogue, without overwriting your edits or undoing explicit removals.
 
 ### Reporting modes
 

@@ -1,8 +1,7 @@
 """Sensor platform for PyTap integration.
 
-Creates sensor entities for each user-configured Tigo optimizer module.
-Entities are keyed by barcode (stable identifier) and created deterministically
-from the configured module list — no auto-discovery.
+Creates sensor entities for configured and passively discovered optimizers.
+Entities keep stable barcode-based identifiers across discovery and restarts.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ from .const import (
     CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
-    CONF_MODULES,
     DEFAULT_PEAK_POWER,
     DOMAIN,
 )
@@ -269,72 +267,107 @@ async def async_setup_entry(
     Each configured module gets the full set of 12 sensor entities.
     """
     coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    modules: list[dict[str, str]] = entry.data.get(CONF_MODULES, [])
+    known_barcodes: set[str] = set()
+    string_sensors: dict[str, list[PyTapAggregateSensor]] = {}
+    installation_sensors: list[PyTapAggregateSensor] = []
+    installation_device = DeviceInfo(
+        identifiers={(DOMAIN, f"{entry.entry_id}_installation")},
+        name="Tigo Installation",
+        manufacturer="Tigo Energy",
+        model="Installation Aggregate",
+    )
 
-    entities: list[SensorEntity] = []
-    string_to_barcodes: dict[str, list[str]] = {}
-    all_barcodes: list[str] = []
+    @callback
+    def add_discovered_entities() -> None:
+        """Called on HA's loop: add new optimizer entities exactly once."""
+        if len(known_barcodes) == coordinator.module_count:
+            return
+        entities: list[SensorEntity] = []
+        string_to_barcodes: dict[str, list[str]] = {}
+        all_barcodes: list[str] = []
+        for module_config in coordinator.modules:
+            barcode = module_config.get(CONF_MODULE_BARCODE, "")
+            if not barcode:
+                continue
+            all_barcodes.append(barcode)
+            if string_name := module_config.get(CONF_MODULE_STRING, ""):
+                string_to_barcodes.setdefault(string_name, []).append(barcode)
+            if barcode in known_barcodes:
+                continue
+            known_barcodes.add(barcode)
+            for description in SENSOR_DESCRIPTIONS:
+                entities.append(PyTapSensor(coordinator, description, module_config, entry))
 
-    for module_config in modules:
-        barcode = module_config.get(CONF_MODULE_BARCODE, "")
-        string_name = module_config.get(CONF_MODULE_STRING, "")
-        if not barcode:
-            continue
-        all_barcodes.append(barcode)
-        if string_name:
-            string_to_barcodes.setdefault(string_name, []).append(barcode)
-
-        for description in SENSOR_DESCRIPTIONS:
-            entities.append(
-                PyTapSensor(
-                    coordinator=coordinator,
-                    description=description,
-                    module_config=module_config,
-                    entry=entry,
+        for string_name, barcodes in string_to_barcodes.items():
+            if string_name not in string_sensors:
+                device_info = DeviceInfo(
+                    identifiers={(DOMAIN, f"{entry.entry_id}_string_{string_name}")},
+                    name=f"Tigo String {string_name}",
+                    manufacturer="Tigo Energy",
+                    model="String Aggregate",
                 )
-            )
+                string_sensors[string_name] = [
+                    PyTapAggregateSensor(
+                        coordinator,
+                        description,
+                        barcodes,
+                        device_info,
+                        f"{DOMAIN}_{entry.entry_id}_string_{string_name}_{description.key}",
+                    )
+                    for description in STRING_SENSOR_DESCRIPTIONS
+                ]
+                entities.extend(string_sensors[string_name])
+            for sensor in string_sensors[string_name]:
+                sensor.set_barcodes(barcodes)
 
-    for string_name, barcodes in string_to_barcodes.items():
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_string_{string_name}")},
-            name=f"Tigo String {string_name}",
-            manufacturer="Tigo Energy",
-            model="String Aggregate",
-        )
-        for description in STRING_SENSOR_DESCRIPTIONS:
-            entities.append(
+        if all_barcodes and not installation_sensors:
+            installation_sensors.extend(
                 PyTapAggregateSensor(
-                    coordinator=coordinator,
-                    description=description,
-                    barcodes=barcodes,
-                    device_info=device_info,
-                    unique_id=(
-                        f"{DOMAIN}_{entry.entry_id}_string_{string_name}_{description.key}"
-                    ),
+                    coordinator,
+                    description,
+                    all_barcodes,
+                    installation_device,
+                    f"{DOMAIN}_{entry.entry_id}_installation_{description.key}",
                 )
+                for description in INSTALLATION_SENSOR_DESCRIPTIONS
             )
+            entities.extend(installation_sensors)
+        for sensor in installation_sensors:
+            sensor.set_barcodes(all_barcodes)
+        if entities:
+            async_add_entities(entities)
 
-    if all_barcodes:
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry.entry_id}_installation")},
-            name="Tigo Installation",
-            manufacturer="Tigo Energy",
-            model="Installation Aggregate",
-        )
-        for description in INSTALLATION_SENSOR_DESCRIPTIONS:
-            entities.append(
-                PyTapAggregateSensor(
-                    coordinator=coordinator,
-                    description=description,
-                    barcodes=all_barcodes,
-                    device_info=device_info,
-                    unique_id=(
-                        f"{DOMAIN}_{entry.entry_id}_installation_{description.key}"
-                    ),
-                )
-            )
+    # Register before creating entities so aggregate membership is refreshed
+    # before their own coordinator callbacks consume each discovery update.
+    entry.async_on_unload(coordinator.async_add_listener(add_discovered_entities))
+    add_discovered_entities()
+    if coordinator.auto_discovery:
+        async_add_entities([PyTapDiscoverySensor(coordinator, entry, installation_device)])
 
-    async_add_entities(entities)
+
+class PyTapDiscoverySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
+    """Show why an empty automatic setup has no optimizer sensors yet."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "module_discovery"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["waiting_for_modules", "modules_discovered"]
+
+    def __init__(
+        self, coordinator: PyTapDataUpdateCoordinator, entry: ConfigEntry, device_info: DeviceInfo
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_module_discovery"
+        self._attr_device_info = device_info
+
+    @property
+    def native_value(self) -> str:
+        return "modules_discovered" if self.coordinator.module_count else "waiting_for_modules"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"module_count": self.coordinator.module_count}
 
 
 class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
@@ -351,7 +384,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         self,
         coordinator: PyTapDataUpdateCoordinator,
         description: PyTapSensorEntityDescription,
-        module_config: dict[str, str],
+        module_config: dict[str, Any],
         entry: ConfigEntry,
     ) -> None:
         """Initialize the sensor."""
@@ -361,6 +394,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         self._barcode = module_config[CONF_MODULE_BARCODE]
         self._module_name = module_config[CONF_MODULE_NAME]
         self._module_string = module_config.get(CONF_MODULE_STRING, "")
+        self._module_peak_power = coordinator.module_peak_power(self._barcode)
 
         # Unique ID: domain + barcode + sensor key
         self._attr_unique_id = f"{DOMAIN}_{self._barcode}_{description.key}"
@@ -378,6 +412,11 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        if self.entity_description.key == "performance" and self._module_peak_power <= 0:
+            # A percentage from an old rating must not masquerade as a current
+            # value after the user clears the rating, even without a snapshot.
+            self._attr_native_value = None
+            return
         nodes = self.coordinator.data.get("nodes", {})
         node = nodes.get(self._barcode)
         # Only short-circuit to coordinator data if this sensor has a non-None value.
@@ -472,9 +511,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         return datetime.combine(reset_day, time.min, tzinfo=timezone)
 
 
-class PyTapAggregateSensor(
-    CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor
-):
+class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     """Aggregate sensor that sums values across multiple optimizers."""
 
     _attr_has_entity_name = True
@@ -496,9 +533,18 @@ class PyTapAggregateSensor(
         self._attr_device_info = device_info
         self._restored_native_value = False
 
+    def set_barcodes(self, barcodes: list[str]) -> None:
+        """Update aggregate membership without recreating its stable entity."""
+        self._barcodes = list(barcodes)
+
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        if self.entity_description.key == "performance" and any(
+            self.coordinator.module_peak_power(barcode) <= 0 for barcode in self._barcodes
+        ):
+            self._attr_native_value = None
+            return
 
         nodes = self.coordinator.data.get("nodes", {})
         # Only short-circuit to live data if at least one node already has
@@ -507,14 +553,12 @@ class PyTapAggregateSensor(
         value_key = getattr(self.entity_description, "value_key", None)
         if self.entity_description.key == "performance":
             has_fresh_data = any(
-                (node := nodes.get(barcode)) is not None
-                and node.get("power") is not None
+                (node := nodes.get(barcode)) is not None and node.get("power") is not None
                 for barcode in self._barcodes
             )
         elif value_key:
             has_fresh_data = any(
-                (node := nodes.get(barcode)) is not None
-                and node.get(value_key) is not None
+                (node := nodes.get(barcode)) is not None and node.get(value_key) is not None
                 for barcode in self._barcodes
             )
         else:
@@ -549,17 +593,14 @@ class PyTapAggregateSensor(
             return False
         nodes = self.coordinator.data.get("nodes", {})
         return (
-            any(nodes.get(barcode) is not None for barcode in self._barcodes)
-            or self._restored_native_value
+            any(nodes.get(barcode) is not None for barcode in self._barcodes) or self._restored_native_value
         )
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         nodes = self.coordinator.data.get("nodes", {})
-        has_live_nodes = any(
-            nodes.get(barcode) is not None for barcode in self._barcodes
-        )
+        has_live_nodes = any(nodes.get(barcode) is not None for barcode in self._barcodes)
 
         if not has_live_nodes:
             if not self._restored_native_value:
@@ -568,6 +609,11 @@ class PyTapAggregateSensor(
             return
 
         if self.entity_description.key == "performance":
+            if any(self.coordinator.module_peak_power(barcode) <= 0 for barcode in self._barcodes):
+                self._attr_native_value = None
+                self._restored_native_value = False
+                self.async_write_ha_state()
+                return
             total_power = 0.0
             total_peak_power = 0.0
 
@@ -587,15 +633,18 @@ class PyTapAggregateSensor(
                     peak_power_value = float(DEFAULT_PEAK_POWER)
 
                 if peak_power_value <= 0:
-                    continue
+                    # Reporting a percentage for only the rated subset would
+                    # misrepresent the entire group/installation performance.
+                    self._attr_native_value = None
+                    self._restored_native_value = False
+                    self.async_write_ha_state()
+                    return
 
                 total_power += max(power, 0.0)
                 total_peak_power += peak_power_value
 
             if total_peak_power > 0:
-                self._attr_native_value = round(
-                    (total_power / total_peak_power) * 100.0, 2
-                )
+                self._attr_native_value = round((total_power / total_peak_power) * 100.0, 2)
             else:
                 self._attr_native_value = None
             self._restored_native_value = False
@@ -633,9 +682,7 @@ class PyTapAggregateSensor(
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return additional aggregate state attributes."""
         nodes = self.coordinator.data.get("nodes", {})
-        reporting = [
-            barcode for barcode in self._barcodes if nodes.get(barcode) is not None
-        ]
+        reporting = [barcode for barcode in self._barcodes if nodes.get(barcode) is not None]
         return {
             "optimizer_count": len(self._barcodes),
             "reporting_count": len(reporting),

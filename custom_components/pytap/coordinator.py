@@ -23,6 +23,8 @@ from homeassistant.util import dt as dt_util
 
 from .connection import normalize_connection, open_source
 from .const import (
+    CONF_AUTO_DISCOVERY,
+    CONF_EXCLUDED_BARCODES,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
     CONF_MODULE_NAME,
@@ -30,6 +32,7 @@ from .const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_WRITE_INTERVAL,
+    DEFAULT_DISCOVERED_STRING,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_WRITE_INTERVAL,
@@ -96,7 +99,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     Runs a background listener thread that reads from the TCP/serial source,
     feeds bytes into the parser, and dispatches parsed events to the HA event loop.
-    Only events matching user-configured barcodes are stored in coordinator data.
+    Stores user-selected optimizers and, when enabled, newly discovered ones.
     """
 
     config_entry: ConfigEntry
@@ -112,7 +115,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connection = normalize_connection(entry.data)
         self._connected = False
         self._retries = 0
-        self._modules: list[dict[str, Any]] = entry.data.get(CONF_MODULES, [])
+        self._modules: list[dict[str, Any]] = [dict(m) for m in entry.data.get(CONF_MODULES, [])]
+        self._auto_discovery: bool = entry.data.get(CONF_AUTO_DISCOVERY, False)
+        self._excluded_barcodes: set[str] = set(entry.data.get(CONF_EXCLUDED_BARCODES, []))
+        self._auto_modules: dict[str, dict[str, Any]] = {}
         self._live_reporting: bool = entry.data.get(CONF_LIVE_REPORTING, DEFAULT_LIVE_REPORTING)
         raw_write_interval = entry.data.get(CONF_WRITE_INTERVAL, DEFAULT_WRITE_INTERVAL)
         try:
@@ -194,6 +200,70 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return current data (push-based, no polling needed)."""
         return self.data
 
+    @property
+    def modules(self) -> list[dict[str, Any]]:
+        """A snapshot of manual and discovered module metadata for HA's loop."""
+        return [dict(module) for module in list(self._modules)]
+
+    @property
+    def auto_discovery(self) -> bool:
+        """Whether new optimizer barcodes are admitted automatically."""
+        return self._auto_discovery
+
+    @property
+    def module_count(self) -> int:
+        """Cheap catalogue size so platforms can skip unchanged discoveries."""
+        return len(self._configured_barcodes)
+
+    def module_peak_power(self, barcode: str) -> int:
+        """Read the immutable catalogue rating without copying every module."""
+        value = self._module_lookup.get(barcode, {}).get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _add_discovered_module(
+        self, barcode: str, node_id: int | None = None, restored: dict[str, Any] | None = None
+    ) -> bool:
+        """Admit one optimizer without config-entry writes or listener reloads.
+
+        Called by the sole parser worker, or during Store loading before it
+        starts. Known auto modules remain tracked if discovery is later disabled.
+        Explicit configured metadata always wins over saved discovery defaults.
+        """
+        if barcode in self._configured_barcodes or barcode in self._excluded_barcodes:
+            return False
+        if not self._auto_discovery and restored is None:
+            return False
+        module = {
+            CONF_MODULE_BARCODE: barcode,
+            CONF_MODULE_NAME: f"Optimizer {barcode}",
+            CONF_MODULE_STRING: DEFAULT_DISCOVERED_STRING,
+            # Rated panel power is not broadcast by the optimizer. Zero means
+            # unknown; performance is unavailable until the user supplies Wp.
+            CONF_MODULE_PEAK_POWER: 0,
+        }
+        if restored:
+            for field in (CONF_MODULE_NAME, CONF_MODULE_STRING):
+                value = restored.get(field)
+                if isinstance(value, str) and value.strip():
+                    module[field] = value
+            rating = restored.get(CONF_MODULE_PEAK_POWER)
+            if type(rating) is int and 0 <= rating <= 1000:
+                module[CONF_MODULE_PEAK_POWER] = rating
+        self._auto_modules[barcode] = module
+        self._modules.append(module)
+        self._module_lookup[barcode] = module
+        self._configured_barcodes.add(barcode)
+        payload = self._build_node_payload(barcode, module, node_id)
+        if acc := self._energy_state.get(barcode):
+            self._merge_energy_into_node(payload, acc)
+        self.data["nodes"].setdefault(barcode, payload)
+        self._schedule_save()
+        _LOGGER.info("Automatically tracking Tigo optimizer %s", barcode)
+        return True
+
     def get_diagnostics_data(self) -> dict[str, Any]:
         """Return coordinator diagnostics snapshot."""
         return {
@@ -210,6 +280,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "connected": self._connected,
                 "retries": self._retries,
             },
+            "module_discovery": {
+                "enabled": self._auto_discovery,
+                "module_count": len(self._modules),
+                "excluded_barcodes": sorted(self._excluded_barcodes),
+            },
             "energy_state": {
                 barcode: {
                     "daily_energy_wh": round(acc.daily_energy_wh, 2),
@@ -221,7 +296,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ),
                     "readings_today": acc.readings_today,
                 }
-                for barcode, acc in self._energy_state.items()
+                for barcode, acc in dict(self._energy_state).items()
             },
         }
 
@@ -307,7 +382,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("Midnight daily reset — resetting daily accumulators for %s", today)
 
         data_changed = False
-        for barcode, acc in self._energy_state.items():
+        for barcode, acc in dict(self._energy_state).items():
             if acc.daily_reset_date == today:
                 continue
             acc.daily_energy_wh = 0.0
@@ -596,33 +671,28 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Check if this barcode is in our configured allowlist
         if barcode not in self._configured_barcodes:
+            discovered_changed = False
             if barcode not in self._discovered_barcodes:
                 self._discovered_barcodes.add(barcode)
                 self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
                 self._schedule_save()
+                discovered_changed = True
                 _LOGGER.info(
-                    "Discovered unconfigured Tigo optimizer barcode: %s "
-                    "(gateway=%d, node=%d). Add it to your PyTap module "
-                    "list to start tracking.",
+                    "Discovered unconfigured Tigo optimizer barcode: %s (gateway=%d, node=%d).",
                     barcode,
                     event.gateway_id,
                     event.node_id,
                 )
-                return True
-            return False
+            if not self._add_discovered_module(barcode, event.node_id):
+                return discovered_changed
+            # Process this first reading immediately, rather than dropping it
+            # while HA creates the newly discovered sensor entities.
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
-        peak_power_raw = module_meta.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
-        try:
-            peak_power = int(peak_power_raw)
-        except (TypeError, ValueError):
-            peak_power = DEFAULT_PEAK_POWER
-        if peak_power <= 0:
-            peak_power = DEFAULT_PEAK_POWER
-
+        peak_power = self.module_peak_power(barcode)
         performance: float | None = None
-        if event.power is not None:
+        if event.power is not None and peak_power > 0:
             performance = (max(event.power, 0.0) / peak_power) * 100.0
         now = dt_util.now()
 
@@ -725,12 +795,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._discovered_barcodes.add(barcode)
                         discovered_changed = True
                         _LOGGER.info(
-                            "Discovered unconfigured Tigo optimizer barcode: %s "
-                            "(node=%d). Add it to your PyTap module list to "
-                            "start tracking.",
+                            "Discovered unconfigured Tigo optimizer barcode: %s (node=%d).",
                             barcode,
                             node_id,
                         )
+                    self._add_discovered_module(barcode, node_id)
 
         if discovered_changed:
             self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
@@ -872,8 +941,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         total_weight += weight
                     avg_node[field] = round(weighted_sum / total_weight, 3) if total_weight > 0 else None
 
-            if avg_node.get("power") is not None:
-                peak = avg_node.get("peak_power", DEFAULT_PEAK_POWER)
+            peak = avg_node.get("peak_power", DEFAULT_PEAK_POWER)
+            if avg_node.get("power") is not None and peak > 0:
                 avg_node["performance"] = round(
                     (max(avg_node["power"], 0.0) / peak) * 100.0,
                     2,
@@ -963,6 +1032,16 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if stored is None:
             return
 
+        # Restore discovery metadata before node snapshots. The config entry's
+        # explicit list overrides it, including user-edited names/groupings/Wp.
+        for module in stored.get("auto_modules", []):
+            if (
+                isinstance(module, dict)
+                and isinstance(barcode := module.get(CONF_MODULE_BARCODE), str)
+                and barcode
+            ):
+                self._add_discovered_module(barcode, restored=module)
+
         # Restore barcode ↔ node_id mappings
         barcode_to_node = stored.get("barcode_to_node", {})
         for barcode, node_id in barcode_to_node.items():
@@ -973,6 +1052,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         discovered = stored.get("discovered_barcodes", [])
         self._discovered_barcodes = set(discovered)
         self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+        # Turning discovery on can admit barcodes learned in previous manual
+        # sessions, without waiting for another node-table broadcast.
+        for barcode in self._discovered_barcodes:
+            self._add_discovered_module(barcode, self._barcode_to_node.get(barcode))
 
         # Restore parser infrastructure state
         parser_state_data = stored.get("parser_state")
@@ -1029,6 +1112,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if acc is not None:
                 self._merge_energy_into_node(node_payload, acc)
 
+            # A user may have changed/cleared the rating since the last reading.
+            power = node_payload.get("power")
+            peak = node_payload.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
+            node_payload["performance"] = (
+                round(max(power, 0) / peak * 100, 2) if power is not None and peak > 0 else None
+            )
+
             self.data["nodes"][barcode] = node_payload
 
         _LOGGER.info(
@@ -1044,8 +1134,15 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_save_coordinator_state(self) -> None:
         """Save all state (barcode mappings, discovered barcodes, parser state) to HA Store."""
         self._unsaved_changes = False
+        # Discovery can grow these catalogues in the parser worker while HA
+        # prepares a save. Iterate fixed-size copies rather than live mappings.
+        barcode_to_node = dict(self._barcode_to_node)
+        energy_state = dict(self._energy_state)
+        nodes = dict(self.data["nodes"])
+        configured_barcodes = self._configured_barcodes.copy()
         data = {
-            "barcode_to_node": {barcode: node_id for barcode, node_id in self._barcode_to_node.items()},
+            "auto_modules": list(dict(self._auto_modules).values()),
+            "barcode_to_node": barcode_to_node,
             "discovered_barcodes": sorted(self._discovered_barcodes),
             "parser_state": self._persistent_state.to_dict(),
             "energy_data": {
@@ -1059,7 +1156,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         acc.last_reading_ts.isoformat() if acc.last_reading_ts is not None else None
                     ),
                 }
-                for barcode, acc in self._energy_state.items()
+                for barcode, acc in energy_state.items()
             },
             "node_snapshots": {
                 barcode: {
@@ -1086,8 +1183,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "topology",
                     }
                 }
-                for barcode, node in self.data["nodes"].items()
-                if barcode in self._configured_barcodes and isinstance(node, dict)
+                for barcode, node in nodes.items()
+                if barcode in configured_barcodes and isinstance(node, dict)
             },
         }
         try:
