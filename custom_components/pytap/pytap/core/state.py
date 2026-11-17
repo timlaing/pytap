@@ -67,9 +67,7 @@ class SlotClock:
             steps = (index - self._last_index) % self.NUM_INDICES
             for i in range(1, steps):
                 fill_idx = (self._last_index + i) % self.NUM_INDICES
-                self._times[fill_idx] = self._times[self._last_index] + timedelta(
-                    milliseconds=5000.0 * i
-                )
+                self._times[fill_idx] = self._times[self._last_index] + timedelta(milliseconds=5000.0 * i)
         self._last_index = index
         self._last_time = time
 
@@ -137,13 +135,11 @@ class PersistentState:
     def to_dict(self) -> dict:
         """Serialise to a JSON-compatible dict for HA Store."""
         return {
-            "gateway_identities": {
-                str(k): str(v) for k, v in self.gateway_identities.items()
-            },
-            "gateway_versions": {str(k): v for k, v in self.gateway_versions.items()},
+            "gateway_identities": {str(k): str(v) for k, v in dict(self.gateway_identities).items()},
+            "gateway_versions": {str(k): v for k, v in dict(self.gateway_versions).items()},
             "gateway_node_tables": {
-                str(gw): {str(nid): str(addr) for nid, addr in nodes.items()}
-                for gw, nodes in self.gateway_node_tables.items()
+                str(gw): {str(nid): str(addr) for nid, addr in dict(nodes).items()}
+                for gw, nodes in dict(self.gateway_node_tables).items()
             },
         }
 

@@ -13,8 +13,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.typing import ConfigType
 
+from .capture_services import register_capture_services
 from .const import (
     CONF_AUTO_DISCOVERY,
     CONF_CONNECTION_TYPE,
@@ -37,6 +40,7 @@ from .const import (
 from .coordinator import PyTapDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -55,6 +59,12 @@ _LEGACY_UNIQUE_ID_RENAMES: dict[str, str] = {
 }
 # Old unique IDs that no longer have a corresponding entity at all.
 _LEGACY_UNIQUE_IDS_TO_REMOVE: set[str] = {"voltage", "current"}
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register actions once, independent of an individual config entry."""
+    register_capture_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

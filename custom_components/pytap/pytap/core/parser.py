@@ -5,6 +5,7 @@ PV application, and observer) into a single Parser class with a
 feed(bytes) -> list[Event] interface.
 """
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -22,6 +23,7 @@ from .events import (
 )
 from .state import NodeTableBuilder, PersistentState, SlotClock
 from .types import (
+    MAX_SLOT_NUMBER,
     Address,
     Frame,
     FrameType,
@@ -131,7 +133,11 @@ class Parser:
     def __init__(
         self,
         persistent_state: PersistentState | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ):
+        # Offline replay supplies observation time; live behavior is unchanged.
+        self._clock = clock or (lambda: datetime.now())
         # Frame accumulator state
         self._state: _FrameState = _FrameState.IDLE
         self._buffer: bytearray = bytearray()
@@ -379,7 +385,7 @@ class Parser:
         gw_id = frame.address.gateway_id.value
         packet_number = int.from_bytes(payload[2:4], "big")
         self._rx_packet_numbers[gw_id] = packet_number
-        self._captured_slot_times[gw_id] = datetime.now()
+        self._captured_slot_times[gw_id] = self._clock()
         return []
 
     def _handle_receive_response(self, frame: Frame) -> list[Event]:
@@ -431,6 +437,8 @@ class Parser:
         if offset + 2 > len(payload):
             return []
         slot_counter = SlotCounter.from_bytes(payload[offset : offset + 2])
+        if slot_counter.slot_number > MAX_SLOT_NUMBER:
+            return []  # Keep raw evidence, but never index an invalid slot clock.
         offset += 2
 
         # Update stored packet number
@@ -506,8 +514,7 @@ class Parser:
         request_data = self._commands_awaiting.pop(key, None)
         if request_data is None:
             logger.warning(
-                "COMMAND_RESPONSE gw=%d seq=%d pkt_type=%s — "
-                "no matching request (awaiting keys: %s)",
+                "COMMAND_RESPONSE gw=%d seq=%d pkt_type=%s — no matching request (awaiting keys: %s)",
                 gw_id,
                 resp_seq,
                 resp_name,
@@ -529,9 +536,7 @@ class Parser:
             resp_name,
         )
 
-        return self._handle_command_pair(
-            gw_id, req_type, req_payload, resp_packet_type, resp_payload
-        )
+        return self._handle_command_pair(gw_id, req_type, req_payload, resp_packet_type, resp_payload)
 
     def _handle_command_pair(
         self,
@@ -542,15 +547,9 @@ class Parser:
         resp_payload: bytes,
     ) -> list[Event]:
         """Handle a correlated command request/response pair."""
-        if (
-            req_type == PacketType.NODE_TABLE_REQUEST
-            and resp_type == PacketType.NODE_TABLE_RESPONSE
-        ):
+        if req_type == PacketType.NODE_TABLE_REQUEST and resp_type == PacketType.NODE_TABLE_RESPONSE:
             return self._handle_node_table_command(gw_id, req_payload, resp_payload)
-        elif (
-            req_type == PacketType.STRING_REQUEST
-            and resp_type == PacketType.STRING_RESPONSE
-        ):
+        elif req_type == PacketType.STRING_REQUEST and resp_type == PacketType.STRING_RESPONSE:
             return self._handle_string_command(gw_id, req_payload, resp_payload)
         return []
 
@@ -637,12 +636,8 @@ class Parser:
                 len(self._enum_state.gateway_identities),
                 len(self._enum_state.gateway_versions),
             )
-            self._persistent_state.gateway_identities = dict(
-                self._enum_state.gateway_identities
-            )
-            self._persistent_state.gateway_versions = dict(
-                self._enum_state.gateway_versions
-            )
+            self._persistent_state.gateway_identities = dict(self._enum_state.gateway_identities)
+            self._persistent_state.gateway_versions = dict(self._enum_state.gateway_versions)
             self._enum_state = None
             return self._emit_infrastructure_event()
         return []
@@ -693,11 +688,11 @@ class Parser:
         except (ValueError, IndexError):
             return []
 
+        if report.slot_counter.slot_number > MAX_SLOT_NUMBER:
+            return []
         slot_clock = self._slot_clocks.get(gw_id)
         if slot_clock is None:
-            logger.warning(
-                "No slot clock for gateway %d, discarding power report", gw_id
-            )
+            logger.warning("No slot clock for gateway %d, discarding power report", gw_id)
             return []
 
         timestamp = slot_clock.get(report.slot_counter)
@@ -738,7 +733,7 @@ class Parser:
                 node_id=node_id,
                 direction="response",
                 content=content,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -754,7 +749,7 @@ class Parser:
                 gateway_id=gw_id,
                 node_id=node_id,
                 data=data,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -786,8 +781,7 @@ class Parser:
 
         if len(resp_payload) < 4:
             logger.warning(
-                "NODE_TABLE_RESPONSE gw=%d: resp_payload too short "
-                "(%d bytes, need at least 4)",
+                "NODE_TABLE_RESPONSE gw=%d: resp_payload too short (%d bytes, need at least 4)",
                 gw_id,
                 len(resp_payload),
             )
@@ -802,8 +796,7 @@ class Parser:
             entries = []
         elif len(entries_data) < entries_count * 10:
             logger.warning(
-                "NODE_TABLE_RESPONSE gw=%d: corrupt page — "
-                "entries_count=%d but data=%d bytes (expected %d)",
+                "NODE_TABLE_RESPONSE gw=%d: corrupt page — entries_count=%d but data=%d bytes (expected %d)",
                 gw_id,
                 entries_count,
                 len(entries_data),
@@ -813,8 +806,7 @@ class Parser:
         else:
             if len(entries_data) > entries_count * 10:
                 logger.debug(
-                    "NODE_TABLE_RESPONSE gw=%d: %d trailing bytes after "
-                    "%d entries (ignored)",
+                    "NODE_TABLE_RESPONSE gw=%d: %d trailing bytes after %d entries (ignored)",
                     gw_id,
                     len(entries_data) - entries_count * 10,
                     entries_count,
@@ -830,8 +822,7 @@ class Parser:
                 masked_value = raw_node_addr.value & 0x7FFF
                 if raw_node_addr.value != masked_value:
                     logger.debug(
-                        "NODE_TABLE gw=%d: node address 0x%04X has bit-15 "
-                        "set, using masked value %d",
+                        "NODE_TABLE gw=%d: node address 0x%04X has bit-15 set, using masked value %d",
                         gw_id,
                         raw_node_addr.value,
                         masked_value,
@@ -883,7 +874,7 @@ class Parser:
                 node_id=node_addr.value,
                 direction="request",
                 content=request_str,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]
 
@@ -917,6 +908,6 @@ class Parser:
             InfrastructureEvent(
                 gateways=gateways,
                 nodes=nodes,
-                timestamp=datetime.now(),
+                timestamp=self._clock(),
             )
         ]

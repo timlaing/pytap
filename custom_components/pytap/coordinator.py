@@ -11,11 +11,13 @@ import asyncio
 from datetime import datetime, timedelta
 from datetime import time as dt_time
 import logging
+from pathlib import Path
 import threading
 import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -24,6 +26,8 @@ from homeassistant.util import dt as dt_util
 from .connection import normalize_connection, open_source
 from .const import (
     CONF_AUTO_DISCOVERY,
+    CONF_BAUD_RATE,
+    CONF_CONNECTION_TYPE,
     CONF_EXCLUDED_BARCODES,
     CONF_LIVE_REPORTING,
     CONF_MODULE_BARCODE,
@@ -39,12 +43,14 @@ from .const import (
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
     ENERGY_LOW_POWER_THRESHOLD_W,
+    INTEGRATION_VERSION,
     LISTENER_STOP_TIMEOUT,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
 )
 from .energy import EnergyAccumulator, accumulate_energy
+from .pytap.core.capture import CaptureWriter, capture_directory, export_archive, list_captures, read_manifest
 from .pytap.core.events import (
     Event,
     InfrastructureEvent,
@@ -176,6 +182,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Active source handle; the worker owns open/read/close.
         self._source: Any = None
         self._source_lock = threading.Lock()
+        self._connection_generation = 0
+        self._capture: CaptureWriter | None = None
+        self._capture_lock = asyncio.Lock()
+        self._capture_start_future: asyncio.Future | None = None
+        self._capture_export_future: asyncio.Future | None = None
+        self._capture_root = Path(hass.config.path("pytap_captures", entry.entry_id))
 
         # --- Persistence (single HA Store for all state) ---
         self._store = _MigratingStore(hass, STORE_VERSION, f"pytap_{entry.entry_id}_coordinator")
@@ -267,6 +279,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def get_diagnostics_data(self) -> dict[str, Any]:
         """Return coordinator diagnostics snapshot."""
         return {
+            "packet_capture": self.capture_status,
             "node_mappings": {
                 "barcode_to_node": dict(self._barcode_to_node),
                 "node_to_barcode": {
@@ -300,6 +313,114 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             },
         }
 
+    @property
+    def capture_status(self) -> dict[str, Any]:
+        """Only counters and paths in diagnostics; never captured packet data."""
+        return self._capture.status() if self._capture is not None else {"state": "idle"}
+
+    async def async_start_capture(
+        self, duration_minutes: int = 1440, max_storage_mib: int = 1024
+    ) -> dict[str, Any]:
+        """Record the active source without opening another port or bus writes."""
+        async with self._capture_lock:
+            if self._stop_event.is_set():
+                raise ValueError("Listener is not running")
+            if (
+                (self._capture is not None and self._capture.busy)
+                or (self._capture_start_future is not None and not self._capture_start_future.done())
+                or (self._capture_export_future is not None and not self._capture_export_future.done())
+            ):
+                raise ValueError("A capture or export is already running or stopping")
+            if type(duration_minutes) is not int or not 1 <= duration_minutes <= 10080:
+                raise ValueError("Duration must be 1–10080 minutes")
+            if type(max_storage_mib) is not int or not 16 <= max_storage_mib <= 4096:
+                raise ValueError("Storage must be 16–4096 MiB")
+            source = {CONF_CONNECTION_TYPE: self._connection[CONF_CONNECTION_TYPE]}
+            if CONF_BAUD_RATE in self._connection:
+                source.update(
+                    baud_rate=self._connection[CONF_BAUD_RATE], data_bits=8, parity="none", stop_bits=1
+                )
+            writer = CaptureWriter(
+                self._capture_root,
+                {
+                    "integration_version": INTEGRATION_VERSION,
+                    "home_assistant_version": HA_VERSION,
+                    "source": source,
+                    "parser_state": {},
+                    "parser_state_at_capture_boundary": False,
+                    "started_mid_connection": self._connected,
+                    "timestamps": "UTC/monotonic observation times at source.read return; not UART airtime",
+                },
+                duration_seconds=duration_minutes * 60,
+                max_storage_bytes=max_storage_mib * 1024 * 1024,
+            )
+            self._capture = writer  # Publish before enabling the producer.
+            self._capture_start_future = self.hass.async_add_executor_job(writer.start)
+            try:
+                await asyncio.shield(self._capture_start_future)
+            except asyncio.CancelledError:
+                writer.request_stop("start_cancelled")
+                raise
+            writer.mark("capture_started", self._connection_generation, connected=self._connected)
+            return writer.status()
+
+    async def async_stop_capture(self, reason: str = "user") -> dict[str, Any]:
+        """Drain/flush in the executor, preserving evidence on stop and reload."""
+        async with self._capture_lock:
+            writer = self._capture
+            if writer is None:
+                return {"state": "idle"}
+            writer.request_stop(reason)
+            try:
+                async with asyncio.timeout(LISTENER_STOP_TIMEOUT):
+                    if self._capture_start_future is not None:
+                        try:
+                            await asyncio.shield(self._capture_start_future)
+                        except Exception:
+                            pass  # Failed startup is already reflected in status.
+                    await self.hass.async_add_executor_job(writer.join, 10)
+            except TimeoutError:
+                _LOGGER.error("Capture writer is still stopping")
+            return writer.status()
+
+    async def async_list_captures(self) -> list[dict[str, Any]]:
+        return await self.hass.async_add_executor_job(list_captures, self._capture_root)
+
+    async def async_capture_info(self, capture_id: str | None = None) -> dict[str, Any]:
+        if capture_id is None or (self._capture is not None and capture_id == self._capture.capture_id):
+            return self.capture_status
+
+        def info() -> dict[str, Any]:
+            manifest = read_manifest(capture_directory(self._capture_root, capture_id), allow_incomplete=True)
+            return {key: value for key, value in manifest.items() if key not in ("metadata", "segments")}
+
+        return await self.hass.async_add_executor_job(info)
+
+    async def async_export_capture(self, capture_id: str | None = None) -> dict[str, Any]:
+        async with self._capture_lock:
+            capture_id = capture_id or (self._capture.capture_id if self._capture is not None else None)
+            if capture_id is None:
+                raise ValueError("Select a stopped capture ID")
+            if (
+                (self._capture is not None and self._capture.busy)
+                or (self._capture_start_future is not None and not self._capture_start_future.done())
+                or (self._capture_export_future is not None and not self._capture_export_future.done())
+            ):
+                raise ValueError("Stop capture before exporting")
+
+            def export() -> str:
+                return str(
+                    export_archive(capture_directory(self._capture_root, capture_id), allow_interrupted=True)
+                )
+
+            self._capture_export_future = self.hass.async_add_executor_job(export)
+            archive = await asyncio.shield(self._capture_export_future)
+            return {
+                "capture_id": capture_id,
+                "archive": archive,
+                "note": "Private local file; not exposed over HTTP",
+            }
+
     async def async_start_listener(self) -> None:
         """Start the background listener task."""
         if self._worker_future is not None and not self._worker_future.done():
@@ -326,6 +447,19 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._stop_event.set()
 
     async def async_stop_listener(self) -> bool:
+        """Bound the entire shutdown, including both controller lock waits."""
+        self._stop_event.set()
+        if self._capture is not None:
+            # Disarm a preparing writer even when startup/export holds the lock.
+            self._capture.request_stop("unload")
+        try:
+            async with asyncio.timeout(LISTENER_STOP_TIMEOUT):
+                return await self._async_stop_listener_locked()
+        except TimeoutError:
+            _LOGGER.error("PyTap shutdown timed out; worker handles retained and reload blocked")
+            return False
+
+    async def _async_stop_listener_locked(self) -> bool:
         """Await the worker and its port cleanup, without blocking HA's loop.
 
         The worker owns close; reads/open attempts are bounded. Never race a
@@ -354,6 +488,19 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # The worker has exited (and run its finally cleanup). A parser
                 # failure must not prevent timer/state cleanup during unload.
                 _LOGGER.error("PyTap listener exited with %s", type(err).__name__)
+            await self.async_stop_capture("unload")
+            if self._capture_export_future is not None:
+                try:
+                    async with asyncio.timeout(LISTENER_STOP_TIMEOUT):
+                        await asyncio.shield(self._capture_export_future)
+                except TimeoutError:
+                    return False
+                except Exception:
+                    pass  # Export errors do not own the source port.
+            if (self._capture is not None and self._capture.busy) or (
+                self._capture_start_future is not None and not self._capture_start_future.done()
+            ):
+                return False
             self._listener_task = None
             self._worker_future = None
             if self._midnight_reset_unsub is not None:
@@ -428,6 +575,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         return
                     self._source = source
                 self._connected = True
+                self._connection_generation += 1
+                if self._capture is not None:
+                    self._capture.mark("connection_open", self._connection_generation)
                 _LOGGER.info("Connected to Tigo byte stream")
                 retries = 0
                 self._retries = 0
@@ -437,6 +587,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     data = source.read(4096)
                     if data:
                         last_data_time = time.monotonic()
+                        if self._capture is not None:
+                            self._capture.record(
+                                data, self._connection_generation, self._persistent_state.to_dict
+                            )
                         events = parser.feed(data)
                         for event in events:
                             if self._process_event(event):
@@ -464,12 +618,18 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             break
 
             except Exception as err:
+                if self._capture is not None:
+                    self._capture.mark(
+                        "connection_error", self._connection_generation, error=type(err).__name__
+                    )
                 if self._stop_event.is_set():
                     return
                 _LOGGER.warning("Connection error (%s); retrying", type(err).__name__)
             finally:
                 self._connected = False
                 try:
+                    if self._capture is not None:
+                        self._capture.mark("connection_closed", self._connection_generation)
                     self._flush_pending_on_disconnect()
                 finally:
                     # A failed snapshot must never skip releasing the port.

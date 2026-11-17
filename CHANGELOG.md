@@ -4,6 +4,9 @@
 
 ### Added
 
+- Opt-in, admin-only raw capture with bounded asynchronous writing, timestamp/connection indexes, private archives, rotation/storage/duration limits, and explicit loss/error reporting. Off after every restart/reload.
+- Standalone frame inspection/replay retaining unsupported frames, bad CRCs, unknown/extra payload bytes, and using recorded timestamps rather than replay time.
+- Bundled Tigo icons and logos, including high-resolution variants, served locally by Home Assistant's native brands API.
 - Passive automatic optimizer discovery, enabled by default for new setups. Setup can finish before any modules are seen; sensors and aggregate membership grow dynamically as barcodes arrive.
 - Discovery status diagnostics, module metadata editing, and persistent ignore rules for explicitly removed optimizers.
 - Home Assistant ESPHome serial proxies and local serial adapters, selectable with the native serial-port picker during setup and connection changes.

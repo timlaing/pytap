@@ -68,6 +68,18 @@ PyTap also creates aggregate virtual devices:
 
 ## Installation
 
+### Branding
+
+Tigo icons and logos are bundled in `custom_components/pytap/brand/`, with
+normal and high-resolution images. Home Assistant serves them locally without
+requiring a brands-CDN submission or a separate installation. Dark-theme
+requests use HA's native image fallback. After updating the integration,
+restart HA and refresh the frontend if the old placeholder is still visible.
+
+The graphics identify Tigo hardware; PyTap remains an unofficial community
+integration. Image sources and trademark attribution are documented in
+[`brand/README.md`](custom_components/pytap/brand/README.md).
+
 ### Manual
 
 1. Copy the `custom_components/pytap` folder into your Home Assistant `config/custom_components/` directory.
@@ -233,6 +245,93 @@ On startup, PyTap restores persisted coordinator state (barcode mappings, energy
 ---
 
 ## Development
+
+### Raw packet capture (opt-in)
+
+Version 1.5 adds admin-only actions under **Tools → Actions**. Capture is **off
+by default**, and never resumes automatically after a restart or integration
+reload. It copies reads from the existing listener before decoding, without
+opening another connection or transmitting any bus commands.
+
+1. Call **`pytap.start_capture`**, select the PyTap instance, and choose:
+   - `duration_minutes`: maximum duration, default **1440** (24 hours).
+   - `max_storage_mib`: recording storage budget, default **1024** (1 GiB).
+2. Use **`pytap.capture_status`** to check progress, stop reason, queue/disk
+   errors, and dropped bytes/records. Capture status is also in diagnostics.
+3. Call **`pytap.stop_capture`** when finished, or let the limit stop it.
+4. **`pytap.list_captures`** lists the latest 20 sessions, including those from
+   previous runs. Pass a returned `capture_id` to status/export for an older
+   session, or omit it to use the current session.
+5. **`pytap.export_capture`** validates and creates a private ZIP, returning its
+   local archive path. Retrieve it through Samba/your existing file-management
+   app. It is deliberately **not published at a web endpoint**. Stop recording
+   before exporting; ZIP creation needs extra free disk space. Existing ZIPs
+   count against the budget of subsequent recording sessions.
+
+The writer uses a bounded, non-blocking queue. On backpressure it stops recording
+and reports loss rather than slowing the parser. On storage exhaustion it stops
+instead of deleting earlier evidence. Raw segments rotate at **16 MiB**; the
+budget includes existing recordings/exports for that config entry and reserves
+space for metadata. Archive creation is an explicit additional operation, not
+part of a running recorder's reserved space. No capture files are automatically
+removed. Free budget by deliberately moving/deleting evidence after copying it.
+
+Files live below `/config/pytap_captures/<config_entry_id>/<capture_id>/`:
+
+| File                   | Contents                                                                                                                 |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `bus-000000.bin`, …    | Unchanged bytes: unknown types, bad CRCs, escaped bytes, extra report fields, and noise                                  |
+| `chunks-000000.bin`, … | UTC/monotonic nanoseconds, logical byte offset, length, connection generation (`<QQQII`, little-endian, 32 bytes/record) |
+| `events.jsonl`         | Connection open/close/error markers, without endpoints or exception text                                                 |
+| `manifest.json`        | Source/framing/software versions, initial infrastructure, checksums/counts, completeness/loss/error information          |
+
+Timestamps describe **when a source read returned**, not exact UART-byte airtime.
+Rotation can split a read into index records with the same timestamp. `complete`
+only asserts that the local recorder finalized without known loss; it cannot
+prove that the ESPHome UART, network, or hardware did not drop bytes upstream.
+Failed disk chunks count bytes not confirmed written and indexed, even when an
+unindexed raw tail remains available for forensic inspection.
+
+Captures contain hardware identifiers and possibly diagnostic/configuration
+text. Directories/files are private; metadata excludes endpoints/credentials.
+Do not put recordings in `/config/www`, upload automatically, or publish without
+reviewing them. Record ordinary traffic plus a natural enumeration/startup
+cycle. Check status rather than assuming a full 24 hours fits the chosen budget.
+
+### Offline replay and inspection
+
+Download/extract a session and run from this repository with Python 3.11+:
+
+```bash
+python3 scripts/replay_capture.py /path/to/session --output /path/to/new-export
+```
+
+No HA installation is needed. Source files are never changed and an existing
+output directory is never overwritten. The tool streams evidence and produces:
+
+- `chunks.jsonl`: readable observation times, offsets, lengths and connections.
+- `frames.jsonl`: supported/unknown packets, wire bytes, complete headers and
+  payloads, CRC flags, unknown/extra measurement bytes, noise and incomplete
+  frames. Invalid-CRC measurements are inspection-only.
+- `events.jsonl`: current decoder events, using recorded UTC observations for
+  slot-clock reconstruction rather than replay time. Correlation resets at
+  reconnects/gaps; the recorded infrastructure snapshot bootstraps discovery.
+- `summary.json`: completeness/loss and inspection counts.
+
+Incomplete captures require `--allow-incomplete`. Stale checksums/counts and
+partial rows produce warnings and an unverified/incomplete summary, never
+invented bytes. Unindexed tails remain in raw files/ZIP but are not replayed as
+timestamped chunks. A checksum mismatch in a supposedly complete capture is
+always an error, even with that override. Oversized corrupt frames are exported
+as bounded fragments; their full byte stream remains in the raw evidence.
+
+If a crash created rotated segments before updating the manifest, ZIP export
+also preserves those unlisted files and adds `recovery.json`, marking them
+unverified. They are not automatically timestamp-replayed. The initial parser
+state is snapshotted in the listener immediately before the first admitted
+read, so infrastructure changes during file preparation cannot silently assign
+new measurements to stale barcodes. Invalid slot counters remain inspectable
+as raw frames but are rejected by the measurement decoder.
 
 This repository includes a dev container with Home Assistant pre-installed for local development and testing.
 
