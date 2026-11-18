@@ -45,3 +45,17 @@ RECONNECT_RETRIES = 0
 # Energy accumulation tuning
 ENERGY_GAP_THRESHOLD_SECONDS = 120
 ENERGY_LOW_POWER_THRESHOLD_W = 1.0
+
+# Live panel readings become unavailable after this long without a valid power
+# report. Captures showed normal gaps up to ~76 s and dawn start-up gaps up to
+# ~171 s; the CCA itself only uploads every 5 minutes.
+REPORT_TIMEOUT_SECONDS = 180
+FRESHNESS_CHECK_INTERVAL_SECONDS = 5
+
+# Readings outside these bounds are treated as corrupt, not as measurements.
+# TS4 optimizers only step voltage down, so output above input is impossible;
+# the tolerance covers rounding (never exceeded in 217k captured reports).
+MAX_PLAUSIBLE_VOLTAGE = 100.0
+MAX_OUTPUT_ABOVE_INPUT_VOLTS = 2.0
+MIN_PLAUSIBLE_TEMPERATURE = -40.0
+MAX_PLAUSIBLE_TEMPERATURE = 125.0

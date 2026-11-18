@@ -144,6 +144,7 @@ def _make_mock_coordinator(hass, entry, node_data=None):
         ),
         455,
     )
+    coordinator.is_reporting.return_value = True
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
 
@@ -163,8 +164,8 @@ async def test_sensor_entities_created(hass: HomeAssistant) -> None:
 
     await async_setup_entry(hass, entry, capture_entities)
 
-    # 2 modules × 12 + 2 strings × 4 + installation 4 = 36 entities
-    assert len(entities) == 36
+    # 2 modules × 13 + 2 strings × 4 + installation 4 = 38 entities
+    assert len(entities) == 38
 
 
 async def test_sensor_unique_ids(hass: HomeAssistant) -> None:
@@ -246,8 +247,8 @@ async def test_sensor_skips_modules_without_barcode(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    # Only the 2 valid modules should contribute to entities: 2*12 + 2*4 + 4 = 36
-    assert len(entities) == 36
+    # Only the 2 valid modules should contribute to entities: 2*13 + 2*4 + 4 = 38
+    assert len(entities) == 38
 
 
 async def test_sensor_device_info(hass: HomeAssistant) -> None:
@@ -271,7 +272,7 @@ async def test_sensor_device_info(hass: HomeAssistant) -> None:
 
 async def test_sensor_descriptions_count() -> None:
     """Test that we have the expected number of sensor descriptions."""
-    assert len(SENSOR_DESCRIPTIONS) == 12
+    assert len(SENSOR_DESCRIPTIONS) == 13
 
 
 async def test_energy_sensor_descriptions() -> None:
@@ -304,7 +305,7 @@ async def test_daily_energy_last_reset(hass: HomeAssistant) -> None:
 
 
 async def test_aggregate_entity_count_single_string(hass: HomeAssistant) -> None:
-    """Two modules on one string produce 32 entities."""
+    """Two modules on one string produce 34 entities."""
     modules = [
         {
             CONF_MODULE_STRING: "A",
@@ -328,7 +329,7 @@ async def test_aggregate_entity_count_single_string(hass: HomeAssistant) -> None
     entities = []
     await async_setup_entry(hass, entry, lambda e: entities.extend(e))
 
-    assert len(entities) == 32
+    assert len(entities) == 34
 
 
 async def test_readings_today_sensor_metadata(hass: HomeAssistant) -> None:
@@ -844,7 +845,7 @@ def test_coerce_restored_state_value_ignores_unavailable() -> None:
 async def test_restart_restores_snapshot_before_live_stream(
     hass: HomeAssistant,
 ) -> None:
-    """After restart, sensors should be available from restored snapshot data."""
+    """After restart, energy restores from snapshot but live readings wait for a report."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -909,8 +910,8 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 299.2
+    # A restored reading is not current: it must not masquerade as live data.
+    assert power_state.state == STATE_UNAVAILABLE
 
     # Verify energy sensors restore from coordinator snapshot (not zeroed)
     daily_energy_entity_id = ent_reg.async_get_entity_id(
@@ -937,8 +938,12 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 299.2
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 2000.0
 
 
 async def test_restart_uses_restore_entity_fallback_without_snapshot(
@@ -998,8 +1003,12 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 123.4
+    assert power_state.state == STATE_UNAVAILABLE
+
+    energy_entity_id = ent_reg.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_A-1234567B_total_energy")
+    energy_state = hass.states.get(energy_entity_id)
+    assert energy_state is not None
+    assert float(energy_state.state) == 123.4
 
     installation_power_entity_id = ent_reg.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
@@ -1007,5 +1016,9 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 456.7
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    assert float(hass.states.get(installation_energy_id).state) == 456.7

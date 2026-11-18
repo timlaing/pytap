@@ -4,6 +4,8 @@
 
 ### Added
 
+- Per-optimizer diagnostic entities from previously undecoded power-report bytes: **High output mode** (byte 7 top bit, set almost only above ~0.5 A), **Status code** (byte 9 raw value, e.g. `0x64`) and **Low voltage flag** (byte 9 top bit). Names describe captured behaviour; Tigo has not documented these bits.
+- **Reading fault** problem entity per optimizer. It turns on when a report is physically impossible (output voltage above input, voltages outside 0–100 V, or temperature outside −40–125 °C) and clears on the next valid report. Impossible readings are discarded rather than shown or added to energy.
 - Opt-in, admin-only raw capture with bounded asynchronous writing, timestamp/connection indexes, private archives, rotation/storage/duration limits, and explicit loss/error reporting. Off after every restart/reload.
 - Standalone frame inspection/replay retaining unsupported frames, bad CRCs, unknown/extra payload bytes, and using recorded timestamps rather than replay time.
 - Bundled Tigo icons and logos, including high-resolution variants, served locally by Home Assistant's native brands API.
@@ -15,6 +17,7 @@
 
 ### Changed
 
+- Live panel readings (power, voltage, current, temperature, duty cycle, RSSI, performance and the status entities) become unavailable after 180 seconds without a valid report, instead of holding the last value overnight. The timeout comes from ~22 hours of captured traffic. Energy totals stay available. After a restart, live readings stay unavailable until the first new report. String and installation power and performance only count panels that are currently reporting.
 - Config-entry version 7 preserves manual mode on existing installations. Automatically discovered modules use barcode-based names and unknown panel ratings until edited; performance is not guessed from a default rating.
 - Home Assistant 2026.11+ is now required; existing TCP connections migrate automatically to config-entry version 6 without changing entity IDs or energy history.
 - Connection settings now offer TCP or serial/proxy; serial defaults to 38400 baud, 8N1, with no flow control or bus writes.

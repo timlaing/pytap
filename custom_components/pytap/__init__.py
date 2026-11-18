@@ -42,7 +42,7 @@ from .coordinator import PyTapDataUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 # Bumped from 1 → 2 when voltage/current were split into in/out variants.
 # Bumped from 2 → 3 when module string labels became mandatory.

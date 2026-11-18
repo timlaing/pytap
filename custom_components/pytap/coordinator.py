@@ -18,7 +18,8 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import __version__ as HA_VERSION
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -43,11 +44,17 @@ from .const import (
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
     ENERGY_LOW_POWER_THRESHOLD_W,
+    FRESHNESS_CHECK_INTERVAL_SECONDS,
     INTEGRATION_VERSION,
     LISTENER_STOP_TIMEOUT,
+    MAX_OUTPUT_ABOVE_INPUT_VOLTS,
+    MAX_PLAUSIBLE_TEMPERATURE,
+    MAX_PLAUSIBLE_VOLTAGE,
+    MIN_PLAUSIBLE_TEMPERATURE,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
+    REPORT_TIMEOUT_SECONDS,
 )
 from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.capture import CaptureWriter, capture_directory, export_archive, list_captures, read_manifest
@@ -78,6 +85,45 @@ _AVERAGED_FIELDS = (
     "dc_dc_duty_cycle",
     "rssi",
 )
+
+# Persisted per-node fields, restored on startup. Live-status fields
+# (report_monotonic, mode flags) are deliberately session-only.
+_SNAPSHOT_FIELDS = (
+    "gateway_id",
+    "node_id",
+    "voltage_in",
+    "voltage_out",
+    "current_in",
+    "current_out",
+    "power",
+    "performance",
+    "temperature",
+    "dc_dc_duty_cycle",
+    "rssi",
+    "daily_energy_wh",
+    "total_energy_wh",
+    "readings_today",
+    "daily_reset_date",
+    "last_update",
+    "topology",
+    "reading_fault",
+    "fault_reasons",
+    "last_fault_at",
+)
+
+
+def reading_faults(event: PowerReportEvent) -> list[str]:
+    """Return why a power report is physically impossible (empty if plausible)."""
+    faults: list[str] = []
+    if not 0 <= event.voltage_in <= MAX_PLAUSIBLE_VOLTAGE:
+        faults.append("voltage_in_out_of_range")
+    if not 0 <= event.voltage_out <= MAX_PLAUSIBLE_VOLTAGE:
+        faults.append("voltage_out_out_of_range")
+    if event.voltage_out > event.voltage_in + MAX_OUTPUT_ABOVE_INPUT_VOLTS:
+        faults.append("voltage_out_above_input")
+    if not MIN_PLAUSIBLE_TEMPERATURE <= event.temperature <= MAX_PLAUSIBLE_TEMPERATURE:
+        faults.append("temperature_out_of_range")
+    return faults
 
 
 class _MigratingStore(Store):
@@ -179,6 +225,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Midnight reset timer handle
         self._midnight_reset_unsub: asyncio.TimerHandle | None = None
 
+        # Periodic check that marks panels unavailable once reports stop.
+        self._freshness_unsub: CALLBACK_TYPE | None = None
+        self._reporting_barcodes: frozenset[str] = frozenset()
+
         # Active source handle; the worker owns open/read/close.
         self._source: Any = None
         self._source_lock = threading.Lock()
@@ -234,6 +284,36 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
+
+    def seconds_since_report(self, barcode: str) -> float | None:
+        """Seconds since this session's last valid power report, if any."""
+        node = self.data.get("nodes", {}).get(barcode)
+        reported = node.get("report_monotonic") if node else None
+        return None if reported is None else time.monotonic() - reported
+
+    def is_reporting(self, barcode: str) -> bool:
+        """Whether live readings are current (a valid report within the timeout)."""
+        age = self.seconds_since_report(barcode)
+        return age is not None and age < REPORT_TIMEOUT_SECONDS
+
+    def _current_reporting(self) -> frozenset[str]:
+        return frozenset(
+            barcode for barcode in list(self.data.get("nodes", {})) if self.is_reporting(barcode)
+        )
+
+    @callback
+    def async_set_updated_data(self, data: dict[str, Any]) -> None:
+        """Publish data and remember which panels entities saw as reporting."""
+        super().async_set_updated_data(data)
+        self._reporting_barcodes = self._current_reporting()
+
+    @callback
+    def _async_check_freshness(self, _now: datetime | None = None) -> None:
+        """Refresh entities when a panel starts or stops reporting."""
+        reporting = self._current_reporting()
+        if reporting != self._reporting_barcodes:
+            self._reporting_barcodes = reporting
+            self.async_update_listeners()
 
     def _add_discovered_module(
         self, barcode: str, node_id: int | None = None, restored: dict[str, Any] | None = None
@@ -435,6 +515,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name="pytap_listener",
         )
         self._schedule_midnight_reset()
+        self._freshness_unsub = async_track_time_interval(
+            self.hass,
+            self._async_check_freshness,
+            timedelta(seconds=FRESHNESS_CHECK_INTERVAL_SECONDS),
+            cancel_on_shutdown=True,
+        )
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
@@ -506,6 +592,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._midnight_reset_unsub is not None:
                 self._midnight_reset_unsub.cancel()
                 self._midnight_reset_unsub = None
+            if self._freshness_unsub is not None:
+                self._freshness_unsub()
+                self._freshness_unsub = None
             if self._save_task is not None:
                 self._save_task.cancel()
                 self._save_task = None
@@ -850,11 +939,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
+        previous = self.data["nodes"].get(barcode)
+        now = dt_util.now()
+
+        if faults := reading_faults(event):
+            # Keep the last good measurements and freshness; only flag the fault.
+            node = (
+                dict(previous)
+                if previous is not None
+                else self._build_node_payload(barcode, module_meta, event.node_id)
+            )
+            if not (node.get("reading_fault") and node.get("fault_reasons") == faults):
+                _LOGGER.warning(
+                    "Discarded impossible reading from %s (%s): %.2f V in, %.2f V out, %.1f °C",
+                    barcode,
+                    ", ".join(faults),
+                    event.voltage_in,
+                    event.voltage_out,
+                    event.temperature,
+                )
+            node.update(reading_fault=True, fault_reasons=faults, last_fault_at=now.isoformat())
+            self.data["nodes"][barcode] = node
+            self._schedule_save()
+            return True
+
         peak_power = self.module_peak_power(barcode)
         performance: float | None = None
         if event.power is not None and peak_power > 0:
             performance = (max(event.power, 0.0) / peak_power) * 100.0
-        now = dt_util.now()
 
         acc = self._energy_state.setdefault(
             barcode,
@@ -889,11 +1001,18 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temperature": event.temperature,
             "dc_dc_duty_cycle": event.dc_dc_duty_cycle,
             "rssi": event.rssi,
+            "high_output_mode": event.high_output_mode,
+            "status_code": event.status_code,
+            "low_voltage_flag": event.low_voltage_flag,
+            "reading_fault": False,
+            "fault_reasons": [],
+            "last_fault_at": previous.get("last_fault_at") if previous else None,
             "daily_energy_wh": round(acc.daily_energy_wh, 2),
             "total_energy_wh": round(acc.total_energy_wh, 2),
             "readings_today": acc.readings_today,
             "daily_reset_date": acc.daily_reset_date,
             "last_update": now.isoformat(),
+            "report_monotonic": time.monotonic(),
         }
         # Only buffer readings in interval/averaged mode.  In live mode the
         # raw values are pushed immediately, so buffering would grow without
@@ -1135,6 +1254,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temperature": None,
             "dc_dc_duty_cycle": None,
             "rssi": None,
+            "high_output_mode": None,
+            "status_code": None,
+            "low_voltage_flag": None,
+            "reading_fault": False,
+            "fault_reasons": [],
+            "last_fault_at": None,
             "daily_energy_wh": 0.0,
             "total_energy_wh": 0.0,
             "readings_today": 0,
@@ -1148,25 +1273,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         snapshot: dict[str, Any],
     ) -> None:
         """Merge persisted node snapshot fields into a baseline node payload."""
-        for key in (
-            "gateway_id",
-            "node_id",
-            "voltage_in",
-            "voltage_out",
-            "current_in",
-            "current_out",
-            "power",
-            "performance",
-            "temperature",
-            "dc_dc_duty_cycle",
-            "rssi",
-            "daily_energy_wh",
-            "total_energy_wh",
-            "readings_today",
-            "daily_reset_date",
-            "last_update",
-            "topology",
-        ):
+        for key in _SNAPSHOT_FIELDS:
             if key in snapshot:
                 node_payload[key] = snapshot[key]
 
@@ -1319,30 +1426,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for barcode, acc in energy_state.items()
             },
             "node_snapshots": {
-                barcode: {
-                    key: value
-                    for key, value in node.items()
-                    if key
-                    in {
-                        "gateway_id",
-                        "node_id",
-                        "voltage_in",
-                        "voltage_out",
-                        "current_in",
-                        "current_out",
-                        "power",
-                        "performance",
-                        "temperature",
-                        "dc_dc_duty_cycle",
-                        "rssi",
-                        "daily_energy_wh",
-                        "total_energy_wh",
-                        "readings_today",
-                        "daily_reset_date",
-                        "last_update",
-                        "topology",
-                    }
-                }
+                barcode: {key: value for key, value in node.items() if key in _SNAPSHOT_FIELDS}
                 for barcode, node in nodes.items()
                 if barcode in configured_barcodes and isinstance(node, dict)
             },
@@ -1409,28 +1493,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     barcode,
                     EnergyAccumulator(daily_reset_date=now.date().isoformat()),
                 )
-                self.data["nodes"][barcode] = {
-                    "gateway_id": None,
-                    "node_id": self._barcode_to_node[barcode],
-                    "barcode": barcode,
-                    "name": module_meta.get(CONF_MODULE_NAME, barcode),
-                    "string": module_meta.get(CONF_MODULE_STRING, ""),
-                    "peak_power": module_meta.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER),
-                    "voltage_in": None,
-                    "voltage_out": None,
-                    "current_in": None,
-                    "current_out": None,
-                    "power": None,
-                    "performance": None,
-                    "temperature": None,
-                    "dc_dc_duty_cycle": None,
-                    "rssi": None,
-                    "daily_energy_wh": round(acc.daily_energy_wh, 2),
-                    "total_energy_wh": round(acc.total_energy_wh, 2),
-                    "readings_today": acc.readings_today,
-                    "daily_reset_date": acc.daily_reset_date,
-                    "last_update": None,
-                }
+                payload = self._build_node_payload(barcode, module_meta, self._barcode_to_node[barcode])
+                self._merge_energy_into_node(payload, acc)
+                self.data["nodes"][barcode] = payload
 
         _LOGGER.info(
             "Reloaded module config: tracking %d barcodes",

@@ -36,6 +36,9 @@ class PowerReportEvent(Event):
     temperature: float
     dc_dc_duty_cycle: float
     rssi: int
+    high_output_mode: bool | None
+    status_code: int | None
+    low_voltage_flag: bool | None
 
     def __init__(
         self,
@@ -49,7 +52,10 @@ class PowerReportEvent(Event):
         temperature: float,
         dc_dc_duty_cycle: float,
         rssi: int,
-        timestamp: datetime
+        timestamp: datetime,
+        high_output_mode: bool | None = None,
+        status_code: int | None = None,
+        low_voltage_flag: bool | None = None,
     ):
         super().__init__(event_type="power_report", timestamp=timestamp)
         self.gateway_id = gateway_id
@@ -58,13 +64,14 @@ class PowerReportEvent(Event):
         self.voltage_in = voltage_in
         self.voltage_out = voltage_out
         self.current_in = current_in
-        self.current_out = (
-            round((voltage_in * current_in) / voltage_out, 4) if voltage_out else 0.0
-        )
+        self.current_out = round((voltage_in * current_in) / voltage_out, 4) if voltage_out else 0.0
         self.power = round(self.current_out * voltage_out, 4)
         self.temperature = temperature
         self.dc_dc_duty_cycle = dc_dc_duty_cycle
         self.rssi = rssi
+        self.high_output_mode = high_output_mode
+        self.status_code = status_code
+        self.low_voltage_flag = low_voltage_flag
 
 
 @dataclass
@@ -88,9 +95,7 @@ class TopologyEvent(Event):
     node_id: int
     data: bytes
 
-    def __init__(
-        self, *, gateway_id: int, node_id: int, data: bytes, timestamp: datetime
-    ):
+    def __init__(self, *, gateway_id: int, node_id: int, data: bytes, timestamp: datetime):
         super().__init__(event_type="topology", timestamp=timestamp)
         self.gateway_id = gateway_id
         self.node_id = node_id
@@ -111,15 +116,7 @@ class StringEvent(Event):
     direction: str  # "request" or "response"
     content: str
 
-    def __init__(
-        self,
-        *,
-        gateway_id: int,
-        node_id: int,
-        direction: str,
-        content: str,
-        timestamp: datetime
-    ):
+    def __init__(self, *, gateway_id: int, node_id: int, direction: str, content: str, timestamp: datetime):
         super().__init__(event_type="string", timestamp=timestamp)
         self.gateway_id = gateway_id
         self.node_id = node_id

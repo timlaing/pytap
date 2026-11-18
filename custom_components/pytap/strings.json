@@ -90,6 +90,17 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "high_output_mode": {
+        "name": "High output mode"
+      },
+      "low_voltage_flag": {
+        "name": "Low voltage flag"
+      },
+      "reading_fault": {
+        "name": "Reading fault"
+      }
+    },
     "sensor": {
       "module_discovery": {
         "name": "Module discovery",
@@ -157,6 +168,9 @@
       },
       "rssi": {
         "name": "RSSI"
+      },
+      "status_code": {
+        "name": "Status code"
       }
     }
   },
