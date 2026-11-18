@@ -822,6 +822,7 @@ async def test_restart_restores_snapshot_before_live_stream(
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_entry",
         title="PyTap (192.168.1.100)",
@@ -926,6 +927,7 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
             CONF_HOST: "192.168.1.100",
             CONF_PORT: DEFAULT_PORT,
             CONF_MODULES: [MOCK_MODULES[0]],
+            "stale_action": "unavailable",  # Opt-in; the default holds values.
         },
         entry_id="restart_restore_fallback_entry",
         title="PyTap (192.168.1.100)",

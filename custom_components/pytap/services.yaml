@@ -81,8 +81,8 @@ export_capture:
     max_storage_mib:
       name: Storage budget (MiB)
       description: >-
-        The archive counts toward this budget, together with existing captures/exports for this instance.
-        Defaults to the current session's budget (or 1024).
+        The archive counts toward this budget, together with other captures/exports for this instance
+        (the capture being exported is not counted against itself). Defaults to the capture's own budget.
       selector:
         number:
           min: 16
@@ -91,7 +91,8 @@ export_capture:
 delete_capture:
   name: Delete packet capture
   description: >-
-    Permanently delete one stopped capture session and its exported archives. The active session
+    Permanently delete one stopped capture session and its exported archives (including archives left
+    behind after the capture folder was removed). The active session
     cannot be deleted. Captures are stored in the Home Assistant configuration directory and are
     therefore included in Home Assistant backups; delete them (and older backups) to remove them fully.
   fields:

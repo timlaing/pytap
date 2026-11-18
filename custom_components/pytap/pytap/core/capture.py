@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import stat
 import struct
 import tempfile
 import threading
@@ -28,7 +30,10 @@ import zipfile
 
 INDEX = struct.Struct("<QQQII")
 MAX_RECORD_BYTES = 65536
-FORMAT_VERSION = 1
+# Format 2 adds the checksummed "events" block. Format 1 (no event-log
+# checksum) is still readable; its event log is reported as unverified.
+FORMAT_VERSION = 2
+_SUPPORTED_FORMATS = (1, FORMAT_VERSION)
 MANIFEST_RESERVE = 1024 * 1024
 FREE_SPACE_RESERVE = 64 * 1024 * 1024
 MANIFEST_INTERVAL = 10.0
@@ -61,8 +66,17 @@ class CaptureError(ValueError):
         self.translation_placeholders = placeholders
 
 
+class CaptureRuntimeError(CaptureError):
+    """A translatable runtime failure (e.g. disk space), not a problem with the request."""
+
+
 def _mib(value: int) -> str:
     return str(max(0, -(-value // (1024 * 1024))))
+
+
+def _check_root(root: Path) -> None:
+    if root.is_symlink():
+        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
 
 
 def _private_file(path: Path) -> BinaryIO:
@@ -171,6 +185,7 @@ class CaptureWriter:
         self._events_hash = hashlib.sha256()
         self._events_bytes = 0
         self._manifest_data: bytes | None = None
+        self._new_entries = False
 
     @property
     def busy(self) -> bool:
@@ -212,8 +227,7 @@ class CaptureWriter:
                 raise ValueError("Capture has already started")
             self._state = "starting"
         try:
-            if self.root.is_symlink():
-                raise ValueError("Capture root must not be a symlink")
+            _check_root(self.root)
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             self._session_budget = min(
                 self.max_storage_bytes - _tree_size(self.root),
@@ -228,6 +242,7 @@ class CaptureWriter:
             self.directory.mkdir(mode=0o700)
             _fsync_dir(self.root)
             self._events = _private_file(self.directory / EVENTS_FILE)
+            self._new_entries = True
             self._open_segment()
             with self._lock:
                 if not self._stop.is_set():
@@ -354,6 +369,7 @@ class CaptureWriter:
         raw_name, index_name = f"bus-{number:06d}.bin", f"chunks-{number:06d}.bin"
         self._raw = _private_file(self.directory / raw_name)
         self._index = _private_file(self.directory / index_name)
+        self._new_entries = True
         self._raw_hash, self._index_hash = hashlib.sha256(), hashlib.sha256()
         self._segments.append({"file": raw_name, "index": index_name, "bytes": 0, "records": 0})
 
@@ -463,6 +479,10 @@ class CaptureWriter:
             if handle is not None:
                 handle.flush()
                 os.fsync(handle.fileno())
+        if self._new_entries:
+            # New segment names must be durable before a manifest references them.
+            _fsync_dir(self.directory)
+            self._new_entries = False
 
     def _write_manifest(self) -> None:
         """Rewrite only on change; data files are fsynced first, then the directory."""
@@ -565,10 +585,16 @@ class CaptureWriter:
             self._try_manifest()
 
 
-def capture_directory(root: Path, capture_id: str) -> Path:
-    """Resolve a generated session ID, never an arbitrary caller-supplied path."""
+def _check_capture_id(capture_id: Any) -> None:
     if not isinstance(capture_id, str) or not CAPTURE_ID_PATTERN.fullmatch(capture_id):
         raise CaptureError("invalid_capture_id", "Invalid capture ID")
+
+
+def capture_directory(root: Path, capture_id: str) -> Path:
+    """Resolve a generated session ID, never an arbitrary caller-supplied path."""
+    _check_capture_id(capture_id)
+    root = Path(root)
+    _check_root(root)
     directory = root / capture_id
     if directory.is_symlink() or not directory.is_dir():
         raise CaptureError("capture_not_found", "Capture directory is unavailable", capture_id=capture_id)
@@ -586,7 +612,12 @@ def _is_digest(value: Any) -> bool:
 def _validate_manifest(manifest: Any, directory: Path) -> None:
     if not isinstance(manifest, dict):
         raise ValueError("Invalid capture manifest")
-    if manifest.get("format_version") != FORMAT_VERSION or manifest.get("index_format") != INDEX.format:
+    version = manifest.get("format_version")
+    if (
+        type(version) is not int
+        or version not in _SUPPORTED_FORMATS
+        or manifest.get("index_format") != INDEX.format
+    ):
         raise ValueError("Unsupported capture format")
     if manifest.get("capture_id") != directory.name or not CAPTURE_ID_PATTERN.fullmatch(directory.name):
         raise ValueError("Capture manifest does not match its directory")
@@ -606,7 +637,7 @@ def _validate_manifest(manifest: Any, directory: Path) -> None:
     ):
         raise ValueError("Invalid capture manifest metadata")
     events = manifest.get("events")
-    if (
+    if version >= 2 and (
         not isinstance(events, dict)
         or events.get("file") != EVENTS_FILE
         or not _is_count(events.get("bytes"))
@@ -639,7 +670,10 @@ def read_manifest(directory: Path, *, allow_incomplete: bool = False) -> dict[st
         raise ValueError("Capture manifest must not be a symlink")
     if path.stat().st_size > MANIFEST_RESERVE:
         raise ValueError("Capture manifest is too large")
-    manifest = json.loads(path.read_text())
+    try:
+        manifest = json.loads(path.read_text())
+    except RecursionError:
+        raise ValueError("Capture manifest is too deeply nested") from None
     _validate_manifest(manifest, directory)
     if not allow_incomplete and (manifest["state"] != "stopped" or not manifest["complete"]):
         raise ValueError("Capture is incomplete; explicitly allow incomplete evidence to inspect it")
@@ -666,6 +700,9 @@ def _events_path(directory: Path) -> Path:
     return path
 
 
+_FORMAT_1_EVENTS_WARNING = "Format 1 capture: the event log has no checksum and is unverified"
+
+
 def _verify_file(path: Path, size: int, digest: str, strict: bool, warn: Callable[[str], None]) -> None:
     if path.stat().st_size != size:
         if strict:
@@ -687,8 +724,11 @@ def _iter_capture(
 ) -> Iterator[CapturedChunk]:
     manifest = read_manifest(directory, allow_incomplete=allow_incomplete)
     strict = not allow_incomplete or manifest["complete"]
-    events = manifest["events"]
-    _verify_file(_events_path(directory), events["bytes"], events["sha256"], strict, warn)
+    if manifest["format_version"] < 2:
+        warn(_FORMAT_1_EVENTS_WARNING)
+    else:
+        events = manifest["events"]
+        _verify_file(_events_path(directory), events["bytes"], events["sha256"], strict, warn)
     previous_offset = 0
     total_bytes = 0
     halted = False
@@ -740,6 +780,8 @@ def iter_capture(directory: Path, *, allow_incomplete: bool = False) -> Iterator
 
 
 def list_captures(root: Path, limit: int = 20) -> list[dict[str, Any]]:
+    root = Path(root)
+    _check_root(root)
     if not root.exists():
         return []
     result = []
@@ -764,11 +806,52 @@ def list_captures(root: Path, limit: int = 20) -> list[dict[str, Any]]:
                     )
                 }
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             result.append({"capture_id": path.name, "state": "invalid_manifest", "complete": False})
         if len(result) >= limit:
             break
     return result
+
+
+# Local/central headers, zip64 extras and descriptors, plus the name twice.
+_ZIP_ENTRY_OVERHEAD = 256
+_ZIP_END_OVERHEAD = 1024
+_COPY_BYTES = 1024 * 1024
+
+
+def _zip_entry_bytes(arcname: str, size: int) -> int:
+    return size + _ZIP_ENTRY_OVERHEAD + 2 * len(arcname.encode())
+
+
+def _open_input(directory_fd: int | None, path: Path) -> tuple[BinaryIO, os.stat_result]:
+    """Open an archive input without following a link swapped in after validation."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        if directory_fd is None:
+            descriptor = os.open(path, flags)
+        else:
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise CaptureError("capture_unsafe", "Unsafe archive input") from None
+        raise
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise CaptureError("capture_unsafe", "Unsafe archive input")
+        return os.fdopen(descriptor, "rb"), info
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _zip_info(arcname: str, info: os.stat_result) -> zipfile.ZipInfo:
+    entry = zipfile.ZipInfo(arcname, max(time.localtime(info.st_mtime)[:6], (1980, 1, 1, 0, 0, 0)))
+    entry.external_attr = (info.st_mode & 0xFFFF) << 16
+    entry.file_size = info.st_size  # Selects zip64 for large inputs up front.
+    entry.compress_type = zipfile.ZIP_DEFLATED
+    entry.compress_level = 1
+    return entry
 
 
 def export_archive(
@@ -776,9 +859,16 @@ def export_archive(
 ) -> Path:
     """Archive stopped evidence, including incomplete captures with clear flags.
 
-    With max_storage_bytes, the archive (estimated as the sum of its inputs)
-    must fit in what remains of the capture root's storage budget.
+    With max_storage_bytes, the archive must fit in the budget left by
+    everything else under the capture root (the capture itself is excluded,
+    so a capture that filled its own budget can still be exported). It must
+    always fit in free disk space. Both limits are also enforced while writing.
     """
+    directory = Path(directory)
+    root = directory.parent
+    _check_root(root)
+    if directory.is_symlink():
+        raise CaptureError("capture_unsafe", "Capture directory must not be a symlink")
     manifest = read_manifest(directory, allow_incomplete=True)
     if manifest["state"] not in ("stopped", "error") and not allow_interrupted:
         raise CaptureError("stop_before_export", "Stop capture before exporting")
@@ -792,57 +882,101 @@ def export_archive(
     issues = list(dict.fromkeys(issues))
     for message in issues:
         warnings.warn(message, RuntimeWarning, stacklevel=2)
-    paths = [directory / "manifest.json", _events_path(directory)]
+    paths = [directory / "manifest.json"]
+    unverified = []
+    if manifest["format_version"] >= 2:
+        paths.append(_events_path(directory))
+    elif (directory / EVENTS_FILE).is_symlink() or (directory / EVENTS_FILE).exists():
+        paths.append(_events_path(directory))
+        unverified.append(EVENTS_FILE)  # Format 1 recorded no event-log checksum.
     for segment in manifest["segments"]:
         paths.extend(_segment_paths(directory, segment))
-    unlisted = []
     if not manifest["complete"]:
         listed = {path.name for path in paths}
         for path in sorted(directory.iterdir()):
             if _UNLISTED_PATTERN.fullmatch(path.name) and path.name not in listed:
                 if path.is_symlink() or not path.is_file():
-                    raise ValueError("Unsafe unlisted segment")
+                    raise CaptureError("capture_unsafe", "Unsafe unlisted segment")
                 paths.append(path)
-                unlisted.append(path.name)
+                unverified.append(path.name)
     if any(path.is_symlink() or not path.is_file() for path in paths):
-        raise ValueError("Unsafe archive input")
-    expected = sum(path.stat().st_size for path in paths)
+        raise CaptureError("capture_unsafe", "Unsafe archive input")
+    recovery = None
+    if not manifest["complete"] or issues or unverified:
+        recovery = json.dumps(
+            {
+                "complete": manifest["complete"],
+                "verified": not issues and not unverified,
+                "format_version": manifest["format_version"],
+                "validation_warnings": issues,
+                "unverified_files": unverified,
+                "note": "Evidence archived verbatim; files with validation warnings, unlisted crash "
+                "segments and format 1 event logs are unverified, and unlisted segments are not "
+                "timestamp-replayed",
+            }
+        ).encode()
+    recovery_name = f"{directory.name}/recovery.json"
+    expected = _ZIP_END_OVERHEAD + sum(
+        _zip_entry_bytes(f"{directory.name}/{path.name}", path.stat().st_size) for path in paths
+    )
+    if recovery is not None:
+        expected += _zip_entry_bytes(recovery_name, len(recovery))
+    limits: list[tuple[int, type[CaptureError], str, str]] = []
     if max_storage_bytes is not None:
-        available = max_storage_bytes - _tree_size(directory.parent)
-        if expected > available:
-            raise CaptureError(
+        others = _tree_size(root) - _tree_size(directory)
+        limits.append(
+            (
+                max_storage_bytes - others,
+                CaptureError,
                 "export_budget_exceeded",
                 "Export would exceed the capture storage budget",
-                required_mib=_mib(expected),
-                available_mib=_mib(available),
             )
-    if shutil.disk_usage(directory).free < expected + FREE_SPACE_RESERVE:
-        raise OSError("Insufficient export space")
-    output = directory.parent / f"{directory.name}-{uuid.uuid4().hex[:8]}.zip"
+        )
+    limits.append(
+        (
+            shutil.disk_usage(root).free - FREE_SPACE_RESERVE,
+            CaptureRuntimeError,
+            "export_insufficient_space",
+            "Insufficient free disk space to export",
+        )
+    )
+    available, error_type, key, message = min(limits, key=lambda limit: limit[0])
+
+    def limit_error(required: int) -> CaptureError:
+        return error_type(key, message, required_mib=_mib(required), available_mib=_mib(available))
+
+    if expected > available:
+        raise limit_error(expected)
+    output = root / f"{directory.name}-{uuid.uuid4().hex[:8]}.zip"
+    directory_fd = None
     try:
+        if os.open in os.supports_dir_fd:
+            directory_fd = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
         with (
             _private_file(output) as handle,
             zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as archive,
         ):
             for path in paths:
-                archive.write(path, arcname=f"{directory.name}/{path.name}")
-            if not manifest["complete"]:
-                archive.writestr(
-                    f"{directory.name}/recovery.json",
-                    json.dumps(
-                        {
-                            "complete": False,
-                            "verified": not issues and not unlisted,
-                            "validation_warnings": issues,
-                            "unverified_files": unlisted,
-                            "note": "Incomplete evidence archived verbatim; files with validation warnings "
-                            "or unlisted crash segments are unverified and not timestamp-replayed",
-                        }
-                    ),
-                )
+                arcname = f"{directory.name}/{path.name}"
+                source, info = _open_input(directory_fd, path)
+                with source, archive.open(_zip_info(arcname, info), "w") as target:
+                    while block := source.read(_COPY_BYTES):
+                        target.write(block)
+                        # Incompressible data can still outgrow the estimate.
+                        if handle.tell() > available:
+                            raise limit_error(handle.tell())
+            if recovery is not None:
+                archive.writestr(recovery_name, recovery)
+        if (size := output.stat().st_size) > available:
+            raise limit_error(size)
     except BaseException:
         output.unlink(missing_ok=True)
         raise
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
     return output
 
 
@@ -855,13 +989,24 @@ def _capture_archives(root: Path, capture_id: str) -> list[Path]:
 
 
 def delete_capture(root: Path, capture_id: str) -> dict[str, Any]:
-    """Delete one capture and its exports; the caller must exclude the active session."""
+    """Delete one capture and its exports; the caller must exclude the active session.
+
+    Archives left behind after their capture directory disappeared are deleted too.
+    """
     root = Path(root)
-    if root.is_symlink():
-        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
-    directory = capture_directory(root, capture_id)
-    entries = list(directory.iterdir())
-    archives = _capture_archives(root, capture_id)
+    _check_root(root)
+    _check_capture_id(capture_id)
+    candidate = root / capture_id
+    directory: Path | None = None
+    entries: list[Path] = []
+    if candidate.is_symlink() or candidate.exists():
+        directory = capture_directory(root, capture_id)
+        entries = list(directory.iterdir())
+        archives = _capture_archives(root, capture_id)
+    else:
+        archives = _capture_archives(root, capture_id) if root.is_dir() else []
+        if not archives:
+            raise CaptureError("capture_not_found", "Capture directory is unavailable", capture_id=capture_id)
     # Validate everything first so a refusal never leaves a half-deleted capture.
     if any(path.is_symlink() or not path.is_file() for path in (*entries, *archives)):
         raise CaptureError("capture_unsafe", "Capture contains unexpected entries")
@@ -869,7 +1014,8 @@ def delete_capture(root: Path, capture_id: str) -> dict[str, Any]:
     for path in (*archives, *entries):
         deleted += path.lstat().st_size
         path.unlink()
-    directory.rmdir()
+    if directory is not None:
+        directory.rmdir()
     _fsync_dir(root)
     return {"capture_id": capture_id, "deleted_archives": len(archives), "deleted_bytes": deleted}
 

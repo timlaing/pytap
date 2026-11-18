@@ -7,7 +7,7 @@ import threading
 from unittest.mock import ANY, MagicMock, patch
 
 from homeassistant.core import Context
-from homeassistant.exceptions import ServiceValidationError, Unauthorized
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError, Unauthorized
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -324,10 +324,19 @@ async def test_service_errors_are_translated(hass, capture_entry):
 
 async def test_unknown_errors_hide_details_behind_a_translated_message(hass, capture_entry):
     entry, _ = capture_entry
-    with patch(
-        "custom_components.pytap.coordinator.list_captures", side_effect=OSError("/private/secret path")
+    with (
+        patch(
+            "custom_components.pytap.coordinator.list_captures", side_effect=OSError("/private/secret path")
+        ),
+        pytest.raises(HomeAssistantError) as err,
     ):
-        assert await _error_key(hass, "list_captures", entry) == ("capture_failed", {"error": "OSError"})
+        await _call(hass, "list_captures", entry)
+    # A runtime failure, not a problem with the request.
+    assert not isinstance(err.value, ServiceValidationError)
+    assert (err.value.translation_key, err.value.translation_placeholders) == (
+        "capture_failed",
+        {"error": "OSError"},
+    )
 
 
 async def test_unloaded_entry_error_is_translated(hass):

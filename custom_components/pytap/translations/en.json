@@ -79,10 +79,11 @@
       "no_modules": "Manual mode requires at least one module. Add a module, or go back and enable automatic discovery.",
       "invalid_host": "Enter a hostname or IP address.",
       "invalid_port": "Enter a port between 1 and 65535.",
-      "invalid_serial_port": "Choose a local absolute device path or a valid Home Assistant serial-proxy URL.",
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
       "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
       "invalid_connection_type": "Choose TCP or serial.",
-      "serial_port_in_use": "Another PyTap entry already uses this serial port.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
       "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
     }
   },
@@ -305,10 +306,11 @@
       "missing_name": "Module name is required.",
       "missing_string": "String group is required.",
       "invalid_port": "Enter a port between 1 and 65535.",
-      "invalid_serial_port": "Choose a local absolute device path or a valid Home Assistant serial-proxy URL.",
+      "invalid_serial_port": "Choose a serial device under /dev (for example /dev/serial/by-id/…) or a valid Home Assistant serial-proxy URL.",
       "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
       "invalid_connection_type": "Choose TCP or serial.",
-      "serial_port_in_use": "Another PyTap entry already uses this serial port.",
+      "serial_port_in_use": "Another PyTap entry already uses this serial port, or is still releasing it.",
+      "connection_in_use": "A PyTap entry that is still shutting down holds this connection. Wait a moment and try again.",
       "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate.",
       "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
@@ -330,7 +332,7 @@
       "message": "The previous PyTap listener is still releasing its connection; setup will retry."
     },
     "invalid_connection_settings": {
-      "message": "The saved connection setting \"{field}\" is invalid. Update it with Configure → Change connection settings."
+      "message": "The saved {field} setting is invalid. Update it with Configure → Change connection settings; the entry then retries setup."
     },
     "capture_entry_not_loaded": {
       "message": "Select a loaded PyTap config entry."
@@ -373,6 +375,12 @@
     },
     "capture_failed": {
       "message": "Packet capture action failed ({error}); check capture status and available storage."
+    },
+    "capture_invalid": {
+      "message": "The selected packet capture is incomplete, corrupt or in an unsupported format; inspect it with the offline replay script or delete it."
+    },
+    "export_insufficient_space": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of disk space is free. Free disk space or delete old captures."
     }
   }
 }

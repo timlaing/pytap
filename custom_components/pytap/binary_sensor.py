@@ -113,6 +113,9 @@ class PyTapBinarySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], BinarySen
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_data_listener([self._barcode], self._handle_coordinator_update)
+        )
         if self.entity_description.live:
             self.async_on_remove(
                 self.coordinator.async_add_freshness_listener(

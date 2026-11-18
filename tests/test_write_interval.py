@@ -591,7 +591,7 @@ class TestLivePushAndIdleFlush:
             coordinator._push_live_update(parser)
 
         assert mock_cstf.called
-        _, payload = mock_cstf.call_args.args
+        _, payload, _ = mock_cstf.call_args.args
         assert payload["nodes"] == coordinator._state["nodes"]
         # Must be a distinct object so listener-thread mutation cannot alias it.
         assert payload["nodes"] is not coordinator._state["nodes"]

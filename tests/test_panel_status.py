@@ -138,8 +138,21 @@ def _uid(key: str, barcode: str = BARCODE) -> str:
     return f"{DOMAIN}_{barcode}_{key}"
 
 
-async def test_default_unavailable_after_120s_fault_and_recovery(hass: HomeAssistant) -> None:
+async def test_default_holds_values_with_120s_timeout(hass: HomeAssistant) -> None:
     entry, coordinator = await _setup(hass)
+    assert coordinator.stale_action == "hold" and coordinator.stale_timeout == 120
+    await _feed(hass, coordinator, _event())
+    power = _state(hass, "sensor", _uid("power")).state
+    _age(coordinator, BARCODE, DEFAULT_STALE_TIMEOUT + 1)
+    await hass.async_block_till_done()
+    assert coordinator.is_reporting(BARCODE) is False
+    assert _state(hass, "sensor", _uid("power")).state == power
+    assert _state(hass, "binary_sensor", _uid("high_output_mode")).state == STATE_ON
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_unavailable_after_120s_fault_and_recovery(hass: HomeAssistant) -> None:
+    entry, coordinator = await _setup(hass, **{CONF_STALE_ACTION: "unavailable"})
     assert coordinator.stale_action == "unavailable" and coordinator.stale_timeout == 120
     installation_power = f"{DOMAIN}_{entry.entry_id}_installation_power"
 
@@ -324,7 +337,9 @@ async def test_fault_persists_but_live_timing_does_not(hass: HomeAssistant) -> N
     assert snapshot["reading_fault"] is True
     assert snapshot["fault_reasons"] == ["voltage_out_out_of_range", "voltage_out_above_input"]
     assert "report_monotonic" not in snapshot
-    assert "status_code" not in snapshot
+    # Status comes from the last *valid* report, saved so "hold" can show it.
+    assert snapshot["status_code"] == 0x64
+    assert snapshot["high_output_mode"] is True
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -419,4 +434,25 @@ async def test_options_flow_stale_timeout_bounds(hass: HomeAssistant, timeout: i
         await hass.config_entries.options.async_configure(
             result["flow_id"], {CONF_STALE_ACTION: "zero", CONF_STALE_TIMEOUT: timeout}
         )
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_hold_restores_status_entities_across_global_updates(hass: HomeAssistant) -> None:
+    """Saved status values survive a restart and a global (e.g. gateway) update."""
+    stored = {
+        "barcode_to_node": {BARCODE: 10},
+        "node_snapshots": {
+            BARCODE: {"power": 50.0, "status_code": 0xE4, "high_output_mode": False, "low_voltage_flag": True}
+        },
+    }
+    with patch(
+        "custom_components.pytap.coordinator._MigratingStore.async_load", new=AsyncMock(return_value=stored)
+    ):
+        entry, coordinator = await _setup(hass)
+    assert coordinator.stale_action == "hold"
+    coordinator.async_set_updated_data(coordinator._snapshot())  # Global update, no report.
+    await hass.async_block_till_done()
+    assert _state(hass, "sensor", _uid("status_code")).state == "0xE4"
+    assert _state(hass, "binary_sensor", _uid("high_output_mode")).state == STATE_OFF
+    assert _state(hass, "binary_sensor", _uid("low_voltage_flag")).state == STATE_ON
     assert await hass.config_entries.async_unload(entry.entry_id)

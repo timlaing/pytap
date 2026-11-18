@@ -79,7 +79,9 @@ def decode_wire_frame(wire: bytes) -> dict[str, Any]:
         if byte == 0x7E:
             offset += 1
             if offset >= len(wire) - 2 or wire[offset] not in _UNESCAPE_MAP:
-                return {**result, "framing_error": "unknown_escape", "crc_valid": None}
+                # Past MAX_FRAME_SIZE the live parser is already discarding a giant.
+                giant = len(decoded) > MAX_FRAME_SIZE
+                return {**result, "framing_error": "unknown_escape", "giant": giant, "crc_valid": None}
             byte = _UNESCAPE_MAP[wire[offset]]
         decoded.append(byte)
         offset += 1
@@ -118,66 +120,83 @@ def decode_wire_frame(wire: bytes) -> dict[str, Any]:
     return result
 
 
+_HUNT, _START, _FRAME, _ESCAPE, _GIANT, _GIANT_ESCAPE = range(6)
+_Framing = tuple[int, int, int]  # State, decoded length, start offset (0 unless in a frame).
+
+
+def _framing_step(state: int, length: int, start: int, position: int, byte: int) -> tuple[_Framing, bool]:
+    """One live-parser framing transition; also reports whether a frame was decoded."""
+    if state == _HUNT:  # Parser IDLE and NOISE share these transitions.
+        return ((_START if byte == 0x7E else _HUNT), 0, 0), False
+    if state == _START:
+        return ((_FRAME, 0, position - 1) if byte == 0x07 else (_HUNT, 0, 0)), False
+    if state == _FRAME:
+        if byte == 0x7E:
+            return (_ESCAPE, length, start), False
+        return ((_FRAME, length + 1, start) if length < MAX_FRAME_SIZE else (_GIANT, 0, 0)), False
+    if state == _ESCAPE:
+        if byte == 0x08:
+            return (_HUNT, 0, 0), True
+        if byte == 0x07:
+            return (_FRAME, 0, position - 1), False
+        if byte in _UNESCAPE_MAP:
+            return ((_FRAME, length + 1, start) if length < MAX_FRAME_SIZE else (_GIANT, 0, 0)), False
+        return (_HUNT, 0, 0), False
+    if state == _GIANT:
+        return ((_GIANT_ESCAPE if byte == 0x7E else _GIANT), 0, 0), False
+    if byte == 0x07:
+        return (_FRAME, 0, position - 1), False
+    return ((_HUNT if byte == 0x08 else _GIANT), 0, 0), False
+
+
+# Every state a live parser can be in when a capture starts (or after lost bytes).
+_ANY_FRAMING: frozenset[_Framing] = frozenset(
+    {(_HUNT, 0, 0), (_START, 0, 0), (_GIANT, 0, 0), (_GIANT_ESCAPE, 0, 0)}
+    | {(state, length, -1) for state in (_FRAME, _ESCAPE) for length in range(MAX_FRAME_SIZE + 1)}
+)
+
+
 class _LiveFraming:
-    """Mirror the live parser's framing transitions to report which frames it would keep."""
+    """Mirror the live parser's framing transitions to report which frames it would keep.
 
-    HUNT, START, FRAME, ESCAPE, GIANT, GIANT_ESCAPE = range(6)
+    When the live parser's starting state is unknown, every possible state is
+    tracked until they converge; verdicts for frames completed earlier are unknown.
+    """
 
-    def __init__(self) -> None:
-        self.reset()
+    def __init__(self, unknown_reason: str | None = None) -> None:
+        self.reset(unknown_reason)
 
-    def reset(self) -> None:
-        self._state = self.HUNT
-        self._length = 0
-        self._start = 0
+    def reset(self, unknown_reason: str | None = None) -> None:
+        self._framing: _Framing = (_HUNT, 0, 0)
         self.completed: dict[int, int] = {}  # End offset -> start offset, decoded by the parser.
-
-    def _begin(self, position: int) -> None:
-        self._state, self._length, self._start = self.FRAME, 0, position - 1
+        self.unknown_reason = unknown_reason
+        self._candidates: set[_Framing] | None = set(_ANY_FRAMING) if unknown_reason else None
+        self._known_from: int | None = None if unknown_reason else -1
 
     def feed(self, offset: int, data: bytes) -> None:
+        framing, candidates = self._framing, self._candidates
         for position, byte in enumerate(data, offset):
-            state = self._state
-            if state == self.HUNT:  # Parser IDLE and NOISE share these transitions.
-                self._state = self.START if byte == 0x7E else self.HUNT
-            elif state == self.START:
-                if byte == 0x07:
-                    self._begin(position)
-                else:
-                    self._state = self.HUNT
-            elif state == self.FRAME:
-                if byte == 0x7E:
-                    self._state = self.ESCAPE
-                elif self._length < MAX_FRAME_SIZE:
-                    self._length += 1
-                else:
-                    self._state = self.GIANT
-            elif state == self.ESCAPE:
-                if byte == 0x08:
-                    self.completed[position + 1] = self._start
-                    self._state = self.HUNT
-                elif byte == 0x07:
-                    self._begin(position)
-                elif byte in _UNESCAPE_MAP:
-                    if self._length < MAX_FRAME_SIZE:
-                        self._length += 1
-                        self._state = self.FRAME
-                    else:
-                        self._state = self.GIANT
-                else:
-                    self._state = self.HUNT
-            elif state == self.GIANT:
-                self._state = self.GIANT_ESCAPE if byte == 0x7E else self.GIANT
-            elif byte == 0x07:
-                self._begin(position)
-            else:
-                self._state = self.HUNT if byte == 0x08 else self.GIANT
+            frame_start = framing[2]
+            framing, done = _framing_step(*framing, position, byte)
+            if done:
+                self.completed[position + 1] = frame_start
+            if candidates is not None:
+                candidates = {_framing_step(*candidate, position, byte)[0] for candidate in candidates}
+                if len(candidates) == 1:
+                    candidates, self._known_from = None, position + 1
+        self._framing, self._candidates = framing, candidates
+
+    def known(self, end: int) -> bool:
+        """Whether every possible starting state agrees on the frame ending at ``end``."""
+        return self._known_from is not None and self._known_from < end
 
     def drop_reason(self, start: int, end: int, frame: dict[str, Any]) -> str | None:
         if self.completed.get(end) != start:
+            if frame.get("giant"):
+                return "giant"
             if frame.get("framing_error") == "unknown_escape":
                 return "unknown_escape"
-            return "giant" if frame.get("giant") else "framing_state"
+            return "framing_state"
         if frame.get("framing_error"):
             return frame["framing_error"]
         return None if frame.get("crc_valid") else "crc_mismatch"
@@ -189,9 +208,12 @@ class FrameScanner:
     Frames larger than the live parser accepts are still shown (``giant``), and
     ``live_parser_would_drop`` reports whether ``Parser.feed`` would discard a
     frame (stray 0x7E before a start marker, invalid escape, giant, runt, CRC).
+    With ``started_mid_connection`` (manifest metadata), the live parser may
+    have been mid-frame when the capture began: until the framing state is
+    determined, that verdict is ``None`` (``unknown_at_capture_start``).
     """
 
-    def __init__(self, max_frame_bytes: int = 65536) -> None:
+    def __init__(self, max_frame_bytes: int = 65536, *, started_mid_connection: bool = False) -> None:
         if max_frame_bytes < 6:
             raise ValueError("Inspection buffer is too small")
         self._buffer = bytearray()
@@ -200,7 +222,7 @@ class FrameScanner:
         self._connection: int | None = None
         self._clock: dict[str, int] = {}
         self._limit = max_frame_bytes
-        self._live = _LiveFraming()
+        self._live = _LiveFraming("unknown_at_capture_start" if started_mid_connection else None)
 
     def _record(self, kind: str, length: int, **details: Any) -> dict[str, Any]:
         wire = bytes(self._buffer[:length])
@@ -215,8 +237,12 @@ class FrameScanner:
         }
         if kind == "frame":
             result.update(decode_wire_frame(wire))
-            reason = self._live.drop_reason(self._offset, self._offset + length, result)
-            result.update(live_parser_would_drop=reason is not None, live_parser_drop_reason=reason)
+            end = self._offset + length
+            if self._live.known(end):
+                reason = self._live.drop_reason(self._offset, end, result)
+                result.update(live_parser_would_drop=reason is not None, live_parser_drop_reason=reason)
+            else:
+                result.update(live_parser_would_drop=None, live_parser_drop_reason=self._live.unknown_reason)
         del self._buffer[:length]
         self._offset += length
         if self._live.completed:
@@ -231,7 +257,10 @@ class FrameScanner:
         ):
             if self._buffer:
                 yield self._record("incomplete", len(self._buffer), reason="connection_or_capture_gap")
-            self._live.reset()  # Replay starts a fresh parser here too.
+            # Each connection starts a fresh live parser (as replay does); lost
+            # bytes within one connection leave its framing state unknown.
+            same_connection = self._connection == chunk.connection_id
+            self._live.reset("unknown_after_capture_gap" if same_connection else None)
         if not self._buffer:
             self._offset = chunk.stream_offset
         self._connection = chunk.connection_id

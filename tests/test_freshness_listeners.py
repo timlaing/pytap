@@ -49,6 +49,7 @@ async def _setup(hass: HomeAssistant) -> tuple[MockConfigEntry, PyTapDataUpdateC
             "connection_type": "tcp",
             "modules": [MODULE, MODULE_B],
             CONF_AUTO_DISCOVERY: False,
+            "stale_action": "unavailable",  # Opt-in; makes freshness visible.
         },
     )
     entry.add_to_hass(hass)

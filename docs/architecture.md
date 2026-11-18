@@ -149,7 +149,7 @@ Entry point for Home Assistant:
 | `async_setup(hass, config)`                             | Register the capture actions once (independent of entries)       |
 | `async_setup_entry(hass, entry)`                        | Create coordinator, start data streaming, forward platform setup |
 | `async_unload_entry(hass, entry)`                       | Stop the listener (bounded), unload platforms                    |
-| `async_remove_entry(hass, entry)`                       | Delete the entry's packet captures                               |
+| `async_remove_entry(hass, entry)`                       | Delete the entry's packet captures and saved state               |
 | `async_remove_config_entry_device(hass, entry, device)` | Allow deleting optimizer devices and empty string devices        |
 | `async_migrate_entry(hass, entry)`                      | Migrate config entries v1 → v7                                   |
 
@@ -157,21 +157,25 @@ Platforms: `binary_sensor`, `sensor`.
 
 **Setup flow:**
 
-1. If a coordinator from a previous load of this entry is in the stopping registry (`hass.data[DOMAIN]`, used only for coordinators whose stop timed out), wait for it to stop; if it still hasn't, raise `ConfigEntryNotReady` (`previous_listener_stopping`) so HA retries.
+1. If a coordinator from a previous load of this entry is parked (`parked_coordinators()`, i.e. `hass.data[DOMAIN]`, used only for coordinators whose stop timed out), wait for it to stop; if it still hasn't, raise `ConfigEntryNotReady` (`previous_listener_stopping`) so HA retries.
 2. Remove legacy `voltage`/`current` entity registry entries.
-3. Instantiate `PyTapDataUpdateCoordinator`. Invalid saved connection settings raise `ConfigEntryError` (`invalid_connection_settings`) instead of retrying forever.
+3. Instantiate `PyTapDataUpdateCoordinator` (claims its configured barcodes). Invalid saved connection settings raise `ConfigEntryError` (`invalid_connection_settings`) instead of retrying forever; saving corrected settings in the options flow schedules a reload of an entry in setup error/retry.
 4. `async_config_entry_first_refresh()` and `async_start_listener()` (loads the Store, starts the worker, midnight reset and freshness timers). No connectivity check: an offline gateway is retried in the background.
 5. Store the coordinator in `entry.runtime_data` (typed `PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]`) and listen for `EVENT_HOMEASSISTANT_STOP` to stop the listener and finalise any capture (HA does not unload entries on shutdown).
-6. If the Store loaded, remove devices for modules that are no longer known and for strings without modules.
+6. If the Store was read without error, remove devices of excluded optimizers and of strings without modules (empty strings are kept while discovery is on and no saved state was restored). Other unknown optimizer devices are kept; users can delete them.
 7. Forward platform setup and register the options update listener (reloads the entry).
+
+If a later step fails, the listener is stopped (releasing its barcode claims), or parked if it won't stop, so a retry can't open the port before it is released.
 
 **Teardown flow:**
 
-1. `async_stop_listener()` — bounded by `LISTENER_STOP_TIMEOUT` (20 s).
-2. Unload platforms.
-3. If the listener didn't stop in time, park the coordinator in the stopping registry (`hass.data[DOMAIN][entry_id]`) so the next setup waits for it.
+1. `async_stop_listener()` — bounded by `LISTENER_STOP_TIMEOUT` (20 s). Timers and the pending save are cancelled even if the worker can't be joined in time.
+2. If it stopped, release the entry's barcode claims; otherwise park the coordinator (`hass.data[DOMAIN][entry_id]`) so the next setup waits for it and config flows treat its serial port or TCP host/port as in use. Once its worker exits, a parked coordinator finishes its own stop (final save) and releases its claims.
+3. Unload platforms.
 
-**Device removal:** deleting an optimizer device removes its module from `entry.data["modules"]` and adds its barcode to `excluded_barcodes` (the entry update reloads PyTap). String devices can be deleted only when no module uses that string; the installation device cannot be deleted.
+**Entry removal:** a parked coordinator gets a bounded stop with all later Store writes blocked; then the entry's captures (after waiting up to 30 s for a running export/delete job, otherwise once it ends) and its Store are deleted.
+
+**Device removal:** deleting an optimizer device (any identifier that isn't the entry's own string/installation ID, so discovered optimizers too, even while the entry isn't loaded) removes its module from `entry.data["modules"]` if present and adds its barcode to `excluded_barcodes` (the entry update reloads PyTap). String devices can be deleted only when no module uses that string; the installation device cannot be deleted.
 
 ### 2. `config_flow.py` — Configuration UI
 
@@ -187,7 +191,7 @@ Platforms: `binary_sensor`, `sensor`.
 | `add_module`   | `string`, `name`, `barcode` (required), `peak_power` (default: 455 Wp)    | Non-empty fields, barcode format, duplicate prevention, peak power 1–1000                                                        |
 | `finish`       | —                                                                         | Manual mode needs at least one module (`no_modules`); serial port re-checked                                                     |
 
-**Connection probe:** opened and closed in the executor without consuming bytes. If it fails, the form shows `cannot_connect`; submitting identical settings again saves them anyway (the listener keeps retrying). Unsupported serial settings show `unsupported_serial_settings`.
+**Connection probe:** opened and closed in the executor without consuming bytes. If it fails, the form shows `cannot_connect`; submitting identical settings again saves them anyway (the listener keeps retrying). Unsupported serial settings show `unsupported_serial_settings`; a path that doesn't resolve to a character device under `/dev/` shows `invalid_serial_port`. A serial port or TCP host/port still held by a parked coordinator shows `serial_port_in_use` / `connection_in_use`.
 
 **Modules:** stored in `ConfigEntry.data["modules"]` as:
 
@@ -214,7 +218,7 @@ DEFAULT_PEAK_POWER = 455           # Wp (watts peak) — STC rating
 DEFAULT_DISCOVERED_STRING = "Discovered"
 DEFAULT_LIVE_REPORTING = True      # Push every reading as it arrives
 DEFAULT_WRITE_INTERVAL = 30        # Seconds between averaged pushes (5–300)
-DEFAULT_STALE_ACTION = "unavailable"  # or "zero" / "hold"
+DEFAULT_STALE_ACTION = "hold"      # or "unavailable" / "zero" (opt-in)
 DEFAULT_STALE_TIMEOUT = 120        # Seconds (60–600)
 FRESHNESS_CHECK_INTERVAL_SECONDS = 5
 LISTENER_STOP_TIMEOUT = 20
@@ -297,7 +301,7 @@ The coordinator is the central bridge between the blocking `pytap` parser and Ho
 
 #### Worker State vs. Published Data
 
-The listener thread owns `self._state` and the energy accumulators (guarded by a `threading.RLock`). Home Assistant only ever sees `self.data`, a snapshot in which every node dict is copied (`_snapshot()`), handed over with `hass.loop.call_soon_threadsafe(async_set_updated_data, snapshot)`. Entities therefore never observe data changing mid-read, and in averaged mode the published averages are never overwritten by raw worker values: nodes without a new reading in the interval keep their previously published averages (energy, status and fault fields still come from the worker), and the midnight reset changes only the daily fields of the published nodes.
+The listener thread owns `self._state` and the energy accumulators (guarded by a `threading.RLock`). Home Assistant only ever sees `self.data`, a snapshot in which every node dict is copied (`_snapshot()`), handed over with `hass.loop.call_soon_threadsafe(async_set_updated_data, snapshot, changed)`. `changed` is the set of barcodes whose data changed since the last publish: only their entities' data listeners (`async_add_data_listener(barcodes, callback)`, registered by per-optimizer sensors and binary sensors for their own barcode and by aggregates for their members) run. Global changes (new modules, gateway or node-table changes) pass `None` and update every coordinator listener. Each snapshot carries a sequence number, so a snapshot taken before a midnight reset can't overwrite the reset when it reaches the loop. Entities therefore never observe data changing mid-read, and in averaged mode the published averages are never overwritten by raw worker values: nodes without a new reading in the interval keep their previously published averages (energy, status and fault fields still come from the worker), and the midnight reset changes only the daily fields of the published nodes.
 
 #### Threading Model
 
@@ -305,7 +309,7 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
 2. **Publishing** — The worker publishes snapshots back to the event loop with `call_soon_threadsafe` (immediately in live mode, once per interval in averaged mode).
 3. **Midnight reset** — `async_track_time_change(hour=0, minute=0, second=0)` resets daily accumulators at every local midnight (DST-safe), even when no reports arrive overnight.
 4. **Freshness check** — `async_track_time_interval` every 5 s recomputes which panels are reporting. Entities register per-barcode callbacks with `async_add_freshness_listener(barcodes, callback)`: live per-optimizer sensors and binary sensors for their own barcode, every aggregate for its current members (re-registered when membership changes). Only the callbacks of panels that started or stopped reporting run (once per registration), not every entity.
-5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately; serial reads are bounded to 1 s), requests any capture to stop, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False` and reload is blocked until the worker exits.
+5. **Stopping** — `async_stop_listener()` sets a `threading.Event`, requests any capture to stop, calls the TCP source's `interrupt()` (socket `shutdown`, waking a blocked `recv` immediately; serial reads are bounded to 1 s), cancels the midnight, freshness and save timers, then awaits the worker. The worker owns `close()`. The whole stop is bounded by `LISTENER_STOP_TIMEOUT`; on timeout it returns `False`, the coordinator is parked and reload is blocked until the worker exits. Once the worker has exited, the final Store save is shielded from cancellation.
 
 ```
  HA Event Loop (main thread)          Executor Thread
@@ -341,8 +345,8 @@ The listener thread owns `self._state` and the energy accumulators (guarded by a
 #### Reconnection
 
 - **Setup while offline** — No connectivity check at setup; the worker keeps retrying.
-- **Connection failure / disconnection** — The worker catches the exception, closes the source, waits `RECONNECT_DELAY` seconds (waking immediately on stop) and reconnects. The first failure is logged once at WARNING with the exception type and errno (never the endpoint); further attempts log at DEBUG until a connection succeeds.
-- **Silence timeout** — If no data arrives for `RECONNECT_TIMEOUT` seconds, the worker reconnects.
+- **Connection failure / disconnection** — The worker catches the exception, closes the source, waits `RECONNECT_DELAY` seconds (waking immediately on stop) and reconnects. The first failure is logged once at WARNING with the exception type and errno (never the endpoint); further attempts log at DEBUG until data is received again (a link that connects and drops immediately doesn't warn again). A read interrupted by stop is not treated as a connection error.
+- **Silence timeout** — If no data arrives for `RECONNECT_TIMEOUT` seconds, the worker reconnects (WARNING once per outage, then DEBUG).
 
 #### Reporting Modes — Live vs. Averaged Interval
 
@@ -359,7 +363,7 @@ Averaging applies only to power, voltage in/out, current in/out, temperature, DC
 
 #### Stale Readings
 
-`is_reporting(barcode)` is true when the published node's last valid report is younger than `stale_timeout` (plus `write_interval` in averaged mode). Entities consult it together with `stale_action` (`unavailable`, `zero`, `hold`); see [Entity Availability](#entity-availability). After a restart no node has a `report_monotonic`, so with `unavailable`/`zero` the restored live values are not presented as current until the first new report.
+`is_reporting(barcode)` is true when the published node's last valid report is younger than `stale_timeout` (plus `write_interval` in averaged mode). Entities consult it together with `stale_action` (`hold` by default, or the opt-in `unavailable` / `zero`; missing or invalid values fall back to `hold`); see [Entity Availability](#entity-availability). After a restart no node has a `report_monotonic`, so with `unavailable`/`zero` the restored live values are not presented as current until the first new report.
 
 #### Data Merging Strategy
 
@@ -379,13 +383,13 @@ All persistent state is in a single **HA Store** (`<config>/.storage/pytap_<entr
 - **`discovered_barcodes`** — Barcodes seen on the bus that weren't configured.
 - **`parser_state`** — `PersistentState.to_dict()` (gateway identities, versions, node tables).
 - **`energy_data`** — Per-barcode accumulator state.
-- **`node_snapshots`** — Last values per tracked barcode, including `reading_fault`, `fault_reasons`, `last_fault_at` (but not `report_monotonic` or the status flags).
+- **`node_snapshots`** — Last values per tracked barcode, including the status flags, `reading_fault`, `fault_reasons`, `last_fault_at` (but not `report_monotonic`).
 
-Saves are throttled (at most one pending, written 10 s after the first change) and flushed on stop. The parser receives the restored `PersistentState` and mutates it in memory; it never performs file I/O. Being under `.storage`, the Store is included in HA backups.
+Saves are throttled (at most one pending, written 10 s after the first change) and flushed on stop. If the Store can't be read, the coordinator logs a warning, skips orphan-device cleanup and writes nothing for the rest of its lifetime, so saved totals aren't replaced with empty state; entry removal also blocks writes. The parser receives the restored `PersistentState` and mutates it in memory; it never performs file I/O. Being under `.storage`, the Store is included in HA backups.
 
 #### Module Discovery
 
-With `auto_discovery` enabled, `_add_discovered_module()` admits a barcode seen in a node table or power report unless it is configured, in `excluded_barcodes`, or already tracked by another loaded PyTap entry. Discovered modules get the name `Optimizer <barcode>`, string `Discovered` and rating 0 Wp (unknown), are saved in the Store (not the config entry, so no reload), and survive restarts. Enabling discovery later also admits barcodes recorded in earlier manual sessions. With discovery off, unconfigured barcodes are only logged:
+With `auto_discovery` enabled, `_add_discovered_module()` admits a barcode seen in a node table or power report unless it is configured, in `excluded_barcodes`, or claimed by another PyTap entry. Claims (`BarcodeClaims`, in `hass.data`) are domain-wide and atomic across worker threads; each coordinator claims its configured barcodes when created (a barcode configured in two entries logs a warning) and releases its claims once its listener has stopped. Discovered modules get the name `Optimizer <barcode>`, string `Discovered` and rating 0 Wp (unknown), are saved in the Store (not the config entry, so no reload), and survive restarts. Enabling discovery later also admits barcodes recorded in earlier manual sessions. With discovery off, unconfigured barcodes are only logged:
 
 ```
 INFO: Discovered unconfigured Tigo optimizer barcode: S-9999999Z (gateway=1, node=55).
@@ -397,7 +401,7 @@ Options changes reload the entry. Because the parser's node tables are restored 
 
 #### Packet Capture
 
-`async_start_capture()` creates a `CaptureWriter` under `<config>/pytap_captures/<entry_id>`. The worker calls `record()` with each read **before** `parser.feed()`; the first admitted read snapshots `PersistentState` into the capture metadata. Connection open/close/error are recorded with `mark()`. The writer runs in its own thread and stops (never blocks the parser) on queue overflow, storage/duration limits or disk errors. Export and delete run in the executor; at most one capture job runs at a time.
+`async_start_capture()` creates a `CaptureWriter` under `<config>/pytap_captures/<entry_id>`. The worker calls `record()` with each read **before** `parser.feed()`; the first admitted read snapshots `PersistentState` into the capture metadata. Connection open/close/error are recorded with `mark()`. The writer runs in its own thread and stops (never blocks the parser) on queue overflow, storage/duration limits or disk errors. Export and delete run in the executor; they are tracked per capture root in `hass.data` (not per coordinator), so at most one capture job runs at a time even across reloads.
 
 ### 5. `sensor.py` — Sensor Platform
 
@@ -449,7 +453,7 @@ String and installation devices use `(DOMAIN, f"{entry_id}_string_{name}")` and 
 
 #### Entity Updates
 
-Sensors are `CoordinatorEntity` + `RestoreSensor`. On each coordinator update they read `coordinator.data["nodes"][barcode][value_key]`, convert the duty cycle to a percentage and the status code to hex, and apply the stale-reading action. The status code sensor writes state only when its value, availability or attributes change and has no `last_update` attribute. Other per-optimizer sensors expose `string_group`, `last_update` and `gateway_id` attributes. On startup, values come from restored coordinator data or, failing that, HA's restore state; per-optimizer and aggregate performance stay unknown while any relevant panel rating is 0.
+Sensors are `CoordinatorEntity` + `RestoreSensor`. On each update (a global coordinator update or a data listener for their barcode) they read `coordinator.data["nodes"][barcode][value_key]`, convert the duty cycle to a percentage and the status code to hex, and apply the stale-reading action. The status code sensor writes state only when its value, availability or attributes change and has no `last_update` attribute. Other per-optimizer sensors expose `string_group`, `last_update` and `gateway_id` attributes. On startup, values come from restored coordinator data or, failing that, HA's restore state; per-optimizer and aggregate performance stay unknown while any relevant panel rating is 0.
 
 #### Entity Availability
 
@@ -458,9 +462,9 @@ Sensors are `CoordinatorEntity` + `RestoreSensor`. On each coordinator update th
 | Power, voltage in/out, current in/out, performance                             | Unavailable when stale                                                       | 0 when stale (performance unknown if unrated) | Last value                     |
 | Temperature, duty cycle, RSSI, status code, high output mode, low voltage flag | Unavailable when stale                                                       | Unavailable when stale                        | Last value                     |
 | Daily/total energy, readings today, reading fault                              | Available once the node has data (energy sensors also with a restored value) | same                                          | same                           |
-| String/installation power & performance                                        | Sum over reporting members; unavailable if none                              | Sum over reporting members; 0 if none         | Sum over all members with data |
+| String/installation power & performance                                        | Sum over reporting members; unavailable if none                              | Stale members count as 0 W; 0 if none         | Sum over all members with data |
 
-In hold mode a sensor with no coordinator node but a restored HA state stays available with that value.
+In hold mode a sensor with no coordinator node but a restored HA state stays available with that value. Status code, high output mode and low voltage flag are saved in node snapshots, so hold mode shows them after a restart (from the last valid report; impossible readings never update them).
 
 #### Aggregate Energy
 
@@ -480,11 +484,12 @@ Three diagnostic binary sensors per optimizer, added like the sensors:
 | `low_voltage_flag` | —            | Byte 9 bit 7                                                                |
 | `reading_fault`    | `problem`    | Coordinator plausibility check; attributes `fault_reasons`, `last_fault_at` |
 
-Byte 7 and byte 9 meanings are correlations from captured data, not confirmed by Tigo. All three write state only when `(available, is_on, attributes)` changes. The two flags follow the stale-reading action (available when stale only in hold mode). The reading fault is unknown before the first report, ignores staleness, and is persisted in node snapshots.
+Byte 7 and byte 9 meanings are correlations from captured data, not confirmed by Tigo. All three write state only when `(available, is_on, attributes)` changes. The two flags follow the stale-reading action (available when stale only in hold mode). The reading fault ignores staleness and is persisted in node snapshots; it is unavailable while the panel has no node data (no report and nothing restored) and unknown while its node has no fault result yet (e.g. a newly discovered panel).
 
 ### 7. `connection.py` — Transports
 
-- `normalize_connection()` validates TCP (host, port 1–65535) or serial settings (local paths must start with `/dev/`; proxy URLs must be `esphome-hass://esphome/<port>?…` with only known identity filters; baud 1–4000000), raising `InvalidConnectionSettings(field, error)`.
+- `normalize_connection()` validates TCP (host, port 1–65535) or serial settings (local paths are normalised with `posixpath.normpath` and must stay under `/dev/`, excluding `/dev/fd`, `/dev/std*`, `/dev/shm` and `/dev/mqueue`; proxy URLs must be `esphome-hass://esphome/<port>?…` with only known identity filters; baud 1–4000000), raising `InvalidConnectionSettings(field, error)`.
+- `check_device_node()` (blocking, called by `open_source()` before any serial open, including the flow probe) requires a local path's symlink target to be a character device that passes the same `/dev/` checks.
 - `resolved_endpoint_key()` resolves symlinks (e.g. `/dev/serial/by-id/…`) so the same port can't be claimed twice.
 - `SerialProxySource` runs `serialx`'s async transport on HA's loop (8N1, no flow control, DTR/RTS untouched) behind a blocking `read()`/`close()` used by the worker; idle reads return `b""` after 1 s.
 - `open_source()` opens a `SerialProxySource` or `pytap` `TcpSource`, closing it again if `connect()` fails.
@@ -492,7 +497,7 @@ Byte 7 and byte 9 meanings are correlations from captured data, not confirmed by
 
 ### 8. `capture_services.py` — Packet-Capture Actions
 
-Admin-only actions with optional responses: `start_capture`, `stop_capture`, `capture_status`, `list_captures`, `export_capture` (optional `max_storage_mib`) and `delete_capture`. They require a loaded PyTap entry and translate `CaptureError` (and generic `ValueError`/`OSError`/`KeyError` as `capture_failed`, with only the exception type) into `ServiceValidationError`. `async_remove_captures()` deletes `pytap_captures/<entry_id>` when the entry is removed. Responses may include local paths; diagnostics do not.
+Admin-only actions with optional responses: `start_capture`, `stop_capture`, `capture_status`, `list_captures`, `export_capture` (optional `max_storage_mib`) and `delete_capture`. They require a loaded PyTap entry. `CaptureError` and other `ValueError`s (invalid evidence: `capture_invalid`) become `ServiceValidationError`; runtime failures — `CaptureRuntimeError` (e.g. `export_insufficient_space`) and `OSError`/`KeyError` (`capture_failed`, with only the exception type) — become `HomeAssistantError`. Export/delete jobs are registered per capture root (`track_capture_job()`), so they stay visible across reloads. `async_remove_captures()` deletes `pytap_captures/<entry_id>` when the entry is removed, after waiting up to 30 s for a running job (otherwise once it ends). Responses may include local paths; diagnostics do not.
 
 ### 9. `manifest.json` — Integration Metadata
 
@@ -562,7 +567,7 @@ Key choices:
 
 The `pytap` parser library is bundled inside the custom component at `custom_components/pytap/pytap/`:
 
-- **Version lock** — The parser version always matches the integration version.
+- **Shipped together** — Each integration release bundles its parser; the parser's own `pytap.__version__` (currently 1.1.1) is not kept in step with the integration version (`manifest.json`, currently 1.5.0).
 - **No PyPI publishing required** — Reduces release complexity for a niche integration.
 - The only runtime requirement is `serialx`, for serial and proxy access.
 
@@ -601,9 +606,9 @@ The worker mutates only `_state`; Home Assistant receives copies. This removes d
 
 New setups discover optimizers passively (no bus commands). Users can switch to manual mode to track only listed barcodes, e.g. when neighbouring installations share the bus. Removed or deleted optimizers are excluded from discovery, and a barcode already tracked by another PyTap entry is not adopted. Existing installations keep manual mode after migration.
 
-### 6. Stale Readings Instead of Holding Values Indefinitely
+### 6. Opt-In Stale Readings
 
-By default live readings become unavailable after a configurable timeout so dashboards and automations don't show night-time or dropped-out values as current. `zero` suits dashboards that prefer 0 W at night; `hold` keeps the original behaviour. Energy totals are never affected.
+The default, `hold`, keeps the original behaviour for new and existing entries. Users can opt in to `unavailable`, so dashboards and automations don't show night-time or dropped-out values as current after a configurable timeout, or `zero`, for dashboards that prefer 0 W at night. Energy totals are never affected.
 
 ### 7. Device Hierarchy
 
@@ -631,7 +636,7 @@ Node data is keyed by `barcode` (not `node_id`), since barcodes are stable while
 | `excluded_barcodes` | list   | `[]`                                           | Barcodes discovery must ignore                                  |
 | `live_reporting`    | bool   | `True`                                         | Push every reading immediately vs. averaged interval            |
 | `write_interval`    | int    | 30                                             | Seconds between averaged pushes (5–300)                         |
-| `stale_action`      | string | `unavailable`                                  | `unavailable`, `zero` or `hold`                                 |
+| `stale_action`      | string | `hold`                                         | `hold`, or opt-in `unavailable` / `zero`                        |
 | `stale_timeout`     | int    | 120                                            | Seconds without a valid report before a panel is stale (60–600) |
 
 **Module fields:** `string` (required group), `name` (required label), `barcode` (required, `X-NNNNNNNC`), `peak_power` (Wp; 455 by default when added manually, 0 = unknown).
@@ -661,12 +666,14 @@ Configurable at runtime without removing the integration: connection, reporting 
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | Gateway unreachable in config/options flow                  | Form shows `cannot_connect`; resubmitting the same settings saves them                      |
 | Gateway unreachable at runtime                              | Worker retries every `RECONNECT_DELAY`; logged once at WARNING                              |
-| Invalid saved connection settings                           | `ConfigEntryError` with the offending field                                                 |
+| Invalid saved connection settings                           | `ConfigEntryError` with the offending setting; saving corrected settings retries setup      |
 | Previous listener still stopping                            | `ConfigEntryNotReady`; HA retries setup                                                     |
+| Saved state can't be read                                   | WARNING; orphan cleanup skipped, no Store writes until the next reload                      |
 | CRC error in protocol data                                  | Parser increments `counters["crc_errors"]`, skips frame                                     |
 | Malformed frame (runt/giant)                                | Parser increments counter, resumes at next frame boundary                                   |
-| Invalid slot counter in receive-response header             | `invalid_slots` incremented; slot-clock update skipped, packets still parsed                |
+| Invalid slot counter in receive-response header             | `invalid_slots` incremented; frame kept only if its packet walk is strict, else dropped     |
 | Power report with invalid slot counter                      | `invalid_slots` incremented; report dropped                                                 |
+| Power report before the gateway has a slot clock            | `no_slot_clock_drops` incremented; report dropped; WARNING once per gateway, then DEBUG     |
 | Node table page with trailing bytes                         | Declared entries parsed, extra bytes ignored                                                |
 | Node address with bit-15 flag set                           | Masked to 15 bits (`& 0x7FFF`)                                                              |
 | No data for `RECONNECT_TIMEOUT`                             | Worker reconnects                                                                           |
@@ -691,6 +698,10 @@ Configurable at runtime without removing the integration: connection, reporting 
 | `test_coordinator_persistence.py` | Event processing, Store save/load, barcode mapping lifecycle     |
 | `test_write_interval.py`          | Live vs. averaged reporting, time-weighted averaging             |
 | `test_panel_status.py`            | Stale-reading actions, status entities, faults, aggregate energy |
+| `test_freshness_listeners.py`     | Freshness changes re-render only affected panels and aggregates  |
+| `test_review2_data.py`            | Stale default, barcode claims, selective updates, aggregates     |
+| `test_review2_lifecycle.py`       | Device cleanup, serial path checks, parked listeners, removal    |
+| `test_review2_capture.py`         | Capture jobs, export budget, formats, replay verdicts, errors    |
 | `test_module_discovery.py`        | Passive admission, persistence, metadata edits                   |
 | `test_listener_lifecycle.py`      | Worker stop/port release before unload/reload                    |
 | `test_review_fixes.py`            | Lifecycle, device registry and connection-safety regressions     |

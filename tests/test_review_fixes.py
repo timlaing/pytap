@@ -179,9 +179,13 @@ async def test_device_removal_rules(hass):
 
 
 async def test_orphaned_devices_are_removed_at_setup(hass):
-    entry = _entry(hass)
+    entry = _entry(hass, **{CONF_EXCLUDED_BARCODES: [OTHER]})
     registry = dr.async_get(hass)
     stale = registry.async_get_or_create(config_entry_id=entry.entry_id, identifiers={(DOMAIN, OTHER)})
+    # Unknown, not excluded: possibly a discovered optimizer whose state was lost.
+    unknown = registry.async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, "E-3456789F")}
+    )
     empty_string = registry.async_get_or_create(
         config_entry_id=entry.entry_id, identifiers={(DOMAIN, f"{entry.entry_id}_string_Old")}
     )
@@ -189,6 +193,7 @@ async def test_orphaned_devices_are_removed_at_setup(hass):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         assert registry.async_get(stale.id) is None
+        assert registry.async_get(unknown.id) is not None
         assert registry.async_get(empty_string.id) is None
         remaining = dr.async_entries_for_config_entry(registry, entry.entry_id)
         assert any((DOMAIN, BARCODE) in device.identifiers for device in remaining)

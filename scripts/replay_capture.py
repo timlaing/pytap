@@ -36,7 +36,9 @@ def main() -> int:
         args.output.mkdir(mode=0o700)
         counts: dict[str, int] = {}
         live_drops: dict[str, int] = {}
-        scanner = FrameScanner()
+        unknown_verdicts: dict[str, int] = {}
+        metadata = manifest.get("metadata", {})
+        scanner = FrameScanner(started_mid_connection=metadata.get("started_mid_connection") is True)
         with (
             private_output(args.output / "chunks.jsonl") as indexes,
             private_output(args.output / "frames.jsonl") as frames,
@@ -47,6 +49,9 @@ def main() -> int:
                 if frame.get("live_parser_would_drop"):
                     reason = frame["live_parser_drop_reason"]
                     live_drops[reason] = live_drops.get(reason, 0) + 1
+                elif frame["kind"] == "frame" and frame.get("live_parser_would_drop") is None:
+                    reason = frame["live_parser_drop_reason"]
+                    unknown_verdicts[reason] = unknown_verdicts.get(reason, 0) + 1
                 frames.write(json.dumps(frame, separators=(",", ":")) + "\n")
 
             for chunk in iter_capture(args.capture, allow_incomplete=args.allow_incomplete):
@@ -68,7 +73,7 @@ def main() -> int:
                     write_frame(frame)
             for frame in scanner.finish():
                 write_frame(frame)
-        state = PersistentState.from_dict(manifest.get("metadata", {}).get("parser_state", {}))
+        state = PersistentState.from_dict(metadata.get("parser_state", {}))
         with private_output(args.output / "events.jsonl") as events:
             for event in replay_events(
                 iter_capture(args.capture, allow_incomplete=args.allow_incomplete), state
@@ -79,12 +84,14 @@ def main() -> int:
                 {
                     "capture_id": manifest["capture_id"],
                     "complete": manifest["complete"],
-                    "integrity_verified": bool(manifest["complete"]),
+                    "integrity_verified": bool(manifest["complete"]) and manifest["format_version"] >= 2,
+                    "format_version": manifest["format_version"],
                     "stop_reason": manifest["stop_reason"],
                     "dropped_bytes": manifest["dropped_bytes"],
                     "dropped_records": manifest["dropped_records"],
                     "records": counts,
                     "frames_live_parser_would_drop": live_drops,
+                    "frames_live_parser_verdict_unknown": unknown_verdicts,
                 },
                 summary,
                 indent=2,

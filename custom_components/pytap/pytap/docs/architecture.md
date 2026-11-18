@@ -228,7 +228,7 @@ Node addresses in `NODE_TABLE_RESPONSE` entries are 16-bit values where bit 15 i
 
 ### 7. Invalid Slot Counters
 
-Slot counters outside 0–11999 are counted in `counters["invalid_slots"]`. An invalid counter in a receive-response header never updates the slot clock, but the frame's packets are still parsed, because each power report carries its own slot counter. A power report whose own counter is invalid has no valid timestamp and is dropped.
+Slot counters outside 0–11999 are counted in `counters["invalid_slots"]`. An invalid counter in a receive-response header never updates the slot clock (in earlier versions it raised `IndexError` out of `feed()`). It also suggests the variable-length header was mis-decoded, so the frame's packets are kept only if a strict walk consumes the payload exactly and every packet is well-formed (`invalid_slot_frames_kept`); otherwise the whole frame is dropped (`invalid_slot_frames_dropped`). Kept power reports still need an existing slot clock for their gateway, like any report; without one they are dropped (`no_slot_clock_drops`, warned once per gateway per parser). A power report whose own counter is invalid has no valid timestamp and is dropped.
 
 ### 8. Injectable Clock
 
@@ -236,7 +236,7 @@ Slot counters outside 0–11999 are counted in `counters["invalid_slots"]`. An i
 
 ### 9. Capture and Replay Outside the Parser
 
-`core.capture` records raw reads before they reach the parser, so unsupported frames, bad CRCs and noise are preserved. Recording uses a bounded queue drained by a writer thread (`record()` never blocks the reader), private files, SHA-256 checksums in a manifest written only after the data is flushed, and explicit loss/stop reasons. `core.replay.FrameScanner` mirrors the parser's framing to report frames the live parser would drop (`live_parser_would_drop`, `giant`). Neither module changes `Parser` behaviour.
+`core.capture` records raw reads before they reach the parser, so unsupported frames, bad CRCs and noise are preserved. Recording uses a bounded queue drained by a writer thread (`record()` never blocks the reader), private files, SHA-256 checksums in a manifest written only after the data is flushed, and explicit loss/stop reasons. `core.replay.FrameScanner` mirrors the parser's framing to report frames the live parser would drop (`live_parser_would_drop`, `giant`); when the parser's starting state is unknown (a capture started mid-connection, or lost bytes), the verdict is `None` until all possible states converge. Neither module changes `Parser` behaviour.
 
 ## Public API Surface
 
@@ -300,7 +300,8 @@ class Parser:
 
     @property
     def counters(self) -> dict:
-        """frames_received, crc_errors, runts, giants, noise_bytes, invalid_slots."""
+        """frames_received, crc_errors, runts, giants, noise_bytes, invalid_slots,
+        invalid_slot_frames_kept, invalid_slot_frames_dropped, no_slot_clock_drops."""
 ```
 
 ### `pytap.core.events`
@@ -367,7 +368,7 @@ Tests reuse captured protocol data from the Rust implementation (`src/test_data.
 3. **Integration**: Full parse pipeline with recorded data, assert correct events
 4. **Regression**: Edge cases from `python/taptap` test suite
 
-Capture and replay are tested by the integration's test suite (`tests/test_packet_capture.py`, `tests/test_capture_integrity.py`, `tests/test_capture_scanner.py`).
+Capture and replay are tested by the integration's test suite (`tests/test_packet_capture.py`, `tests/test_capture_integrity.py`, `tests/test_capture_scanner.py`, `tests/test_review2_capture.py`).
 
 ## Dependencies
 

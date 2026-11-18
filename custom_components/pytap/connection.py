@@ -8,6 +8,7 @@ import logging
 import os
 import posixpath
 import re
+import stat
 from typing import Any, Protocol, TypeVar
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 
@@ -42,6 +43,8 @@ _PROXY_FILTERS = {
 }
 _T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
+# Entries under /dev that alias process file descriptors or memory, not ports.
+_NON_PORT_DEVICES = ("/dev/fd", "/dev/shm", "/dev/mqueue")
 
 
 class InvalidConnectionSettings(ValueError):
@@ -112,10 +115,13 @@ def normalize_connection(data: Mapping[str, Any]) -> dict[str, Any]:
             valid = False
         if not valid:
             raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
-    elif not endpoint.startswith("/dev/") or "\x00" in endpoint:
+    else:
         # Only device nodes: never open arbitrary files (e.g. config) or
-        # special devices outside /dev as a "serial port".
-        raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
+        # special devices outside /dev as a "serial port". Normalise first so
+        # "/dev/../config/secrets.yaml" can't pass as a device path.
+        endpoint = posixpath.normpath(endpoint)
+        if not is_device_path(endpoint):
+            raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
     baud_rate = data.get(CONF_BAUD_RATE, DEFAULT_BAUD_RATE)
     if type(baud_rate) is not int or not 1 <= baud_rate <= 4_000_000:
         raise InvalidConnectionSettings(CONF_BAUD_RATE, "invalid_baud_rate")
@@ -124,6 +130,22 @@ def normalize_connection(data: Mapping[str, Any]) -> dict[str, Any]:
         CONF_SERIAL_PORT: endpoint,
         CONF_BAUD_RATE: baud_rate,
     }
+
+
+def is_device_path(path: str) -> bool:
+    """Whether a normalised absolute path names a device node that could be a port."""
+    if not path.startswith("/dev/") or path.startswith("/dev/std"):
+        return False
+    return not any(path == prefix or path.startswith(f"{prefix}/") for prefix in _NON_PORT_DEVICES)
+
+
+def check_device_node(endpoint: str) -> None:
+    """Reject paths whose symlink target isn't a character device under /dev (blocking)."""
+    if "://" in endpoint:
+        return
+    target = os.path.realpath(endpoint)
+    if not is_device_path(target) or not stat.S_ISCHR(os.stat(target).st_mode):
+        raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
 
 
 def connection_title(data: Mapping[str, Any]) -> str:
@@ -239,6 +261,7 @@ def open_source(loop: asyncio.AbstractEventLoop, data: Mapping[str, Any]) -> Byt
     """Open a source in the executor, closing failed/partially opened sources."""
     settings = normalize_connection(data)
     if settings[CONF_CONNECTION_TYPE] == CONNECTION_SERIAL:
+        check_device_node(settings[CONF_SERIAL_PORT])
         source = SerialProxySource(loop, settings)
     else:
         source = TcpSource(settings[CONF_HOST], settings[CONF_PORT])

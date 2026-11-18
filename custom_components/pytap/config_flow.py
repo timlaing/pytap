@@ -76,6 +76,7 @@ from .const import (
     MIN_WRITE_INTERVAL,
     STALE_ACTIONS,
 )
+from .coordinator import parked_coordinators
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -149,19 +150,39 @@ async def _same_serial_port(hass: HomeAssistant, first: str, second: str) -> boo
 async def serial_port_claimed(
     hass: HomeAssistant, settings: dict[str, Any], entry_id: str | None = None
 ) -> bool:
-    """Avoid probing or saving a serial port owned by another PyTap entry."""
-    if settings[CONF_CONNECTION_TYPE] != CONNECTION_SERIAL:
-        return False
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        if (
-            entry.entry_id != entry_id
-            and entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_SERIAL
-            and await _same_serial_port(
-                hass, entry.data.get(CONF_SERIAL_PORT, ""), settings[CONF_SERIAL_PORT]
-            )
-        ):
+    """Avoid probing or saving a port owned by another PyTap entry or stopping listener.
+
+    A listener whose stop timed out may still hold its serial port or gateway
+    connection after its entry was unloaded, changed or even deleted.
+    """
+    claimed = [
+        entry.data
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.entry_id != entry_id and entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_SERIAL
+    ]
+    claimed.extend(
+        coordinator.connection
+        for parked_id, coordinator in parked_coordinators(hass).items()
+        if parked_id != entry_id
+    )
+    for other in claimed:
+        if other.get(CONF_CONNECTION_TYPE, CONNECTION_TCP) != settings[CONF_CONNECTION_TYPE]:
+            continue
+        if settings[CONF_CONNECTION_TYPE] == CONNECTION_TCP:
+            if (
+                str(other.get(CONF_HOST, "")).lower() == settings[CONF_HOST].lower()
+                and other.get(CONF_PORT, DEFAULT_PORT) == settings[CONF_PORT]
+            ):
+                return True
+        elif await _same_serial_port(hass, other.get(CONF_SERIAL_PORT, ""), settings[CONF_SERIAL_PORT]):
             return True
     return False
+
+
+def _claimed_errors(settings: dict[str, Any]) -> dict[str, str]:
+    if settings[CONF_CONNECTION_TYPE] == CONNECTION_SERIAL:
+        return {CONF_SERIAL_PORT: "serial_port_in_use"}
+    return {"base": "connection_in_use"}
 
 
 async def connection_errors(
@@ -173,7 +194,7 @@ async def connection_errors(
 ) -> dict[str, str]:
     """Reject invalid settings; an unreachable endpoint needs a second submit to save."""
     if await serial_port_claimed(hass, settings, entry.entry_id if entry else None):
-        return {CONF_SERIAL_PORT: "serial_port_in_use"}
+        return _claimed_errors(settings)
     if (
         entry is not None
         and settings[CONF_CONNECTION_TYPE] == CONNECTION_SERIAL
@@ -184,6 +205,9 @@ async def connection_errors(
         return {}
     try:
         await validate_connection(hass, settings)
+    except InvalidConnectionSettings as err:
+        # E.g. a path that resolves to something other than a /dev character device.
+        return {err.field: err.error}
     except (ValueError, serialx.UnsupportedSetting):
         return {"base": "unsupported_serial_settings"}
     except Exception as err:
@@ -348,10 +372,11 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
             )
         if await serial_port_claimed(self.hass, self._user_data):
             # Another flow may have claimed the port while modules were added.
+            connection_type = self._user_data[CONF_CONNECTION_TYPE]
             return self.async_show_form(
-                step_id="serial",
-                data_schema=connection_schema(CONNECTION_SERIAL, self._user_data),
-                errors={CONF_SERIAL_PORT: "serial_port_in_use"},
+                step_id=connection_type,
+                data_schema=connection_schema(connection_type, self._user_data),
+                errors=_claimed_errors(self._user_data),
             )
         data = {
             **self._user_data,
@@ -534,6 +559,13 @@ class PyTapOptionsFlow(OptionsFlow):
                         data={**new_data, **settings},
                         title=connection_title(settings),
                     )
+                    if self._config_entry.state in (
+                        ConfigEntryState.SETUP_ERROR,
+                        ConfigEntryState.SETUP_RETRY,
+                    ):
+                        # Setup failed (e.g. on invalid saved settings) before its
+                        # update listener existed: retry with the corrected ones.
+                        self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
                     return await self.async_step_init()
         return self.async_show_form(
             step_id=f"change_{connection_type}",

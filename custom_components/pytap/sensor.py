@@ -433,6 +433,11 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        # Coordinator listeners only see global updates; panel data changes
+        # notify just this panel's entities.
+        self.async_on_remove(
+            self.coordinator.async_add_data_listener([self._barcode], self._handle_coordinator_update)
+        )
         if self.entity_description.live:
             # Energy totals don't depend on whether the panel is reporting.
             self.async_on_remove(
@@ -617,7 +622,7 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
         self._energy_total: float | None = None
         self._baselines: dict[str, float] = {}
         self._cycle_date: str | None = None
-        self._freshness_unsub: CALLBACK_TYPE | None = None
+        self._member_unsubs: list[CALLBACK_TYPE] = []
 
     @property
     def _is_energy(self) -> bool:
@@ -631,28 +636,29 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
         """Update aggregate membership without recreating its stable entity."""
         changed = set(barcodes) != set(self._barcodes)
         self._barcodes = list(barcodes)
-        if changed and self._freshness_unsub is not None:
-            # Follow membership so new members' freshness changes re-render this.
-            self._freshness_unsub()
-            self._freshness_unsub = self.coordinator.async_add_freshness_listener(
-                self._barcodes, self._handle_coordinator_update
-            )
+        if changed and self._member_unsubs:
+            # Follow membership so new members' changes re-render this.
+            self._subscribe_members()
+
+    @callback
+    def _subscribe_members(self) -> None:
+        """Re-render on members' data and (every aggregate reports reporting_count) freshness."""
+        self._unsubscribe_members()
+        self._member_unsubs = [
+            self.coordinator.async_add_data_listener(self._barcodes, self._handle_coordinator_update),
+            self.coordinator.async_add_freshness_listener(self._barcodes, self._handle_coordinator_update),
+        ]
+
+    @callback
+    def _unsubscribe_members(self) -> None:
+        while self._member_unsubs:
+            self._member_unsubs.pop()()
 
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
-        # Every aggregate reports reporting_count, so all follow member freshness.
-        self._freshness_unsub = self.coordinator.async_add_freshness_listener(
-            self._barcodes, self._handle_coordinator_update
-        )
-
-        @callback
-        def unsubscribe_freshness() -> None:
-            if self._freshness_unsub is not None:
-                self._freshness_unsub()
-                self._freshness_unsub = None
-
-        self.async_on_remove(unsubscribe_freshness)
+        self._subscribe_members()
+        self.async_on_remove(self._unsubscribe_members)
         if self._is_energy:
             await self._async_restore_energy()
             if any(
@@ -812,9 +818,14 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
                 return
             total_power = 0.0
             total_peak_power = 0.0
-            for barcode in members:
+            # Zero mode counts stale panels as 0 W of their full rating, so
+            # performance covers the whole group, not just the reporting subset.
+            zero_stale = self.coordinator.stale_action == STALE_ACTION_ZERO
+            rated = [b for b in self._barcodes if nodes.get(b) is not None] if zero_stale else members
+            reporting = set(members)
+            for barcode in rated:
                 node_data = nodes[barcode]
-                power = node_data.get("power")
+                power = node_data.get("power") if barcode in reporting else 0.0
                 if power is None:
                     continue
                 try:
