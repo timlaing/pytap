@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from datetime import time as dt_time
 import logging
 from pathlib import Path
 import threading
@@ -19,7 +18,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -36,10 +35,14 @@ from .const import (
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     CONF_MODULES,
+    CONF_STALE_ACTION,
+    CONF_STALE_TIMEOUT,
     CONF_WRITE_INTERVAL,
     DEFAULT_DISCOVERED_STRING,
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
+    DEFAULT_STALE_ACTION,
+    DEFAULT_STALE_TIMEOUT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
     ENERGY_GAP_THRESHOLD_SECONDS,
@@ -50,11 +53,13 @@ from .const import (
     MAX_OUTPUT_ABOVE_INPUT_VOLTS,
     MAX_PLAUSIBLE_TEMPERATURE,
     MAX_PLAUSIBLE_VOLTAGE,
+    MAX_STALE_TIMEOUT,
     MIN_PLAUSIBLE_TEMPERATURE,
+    MIN_STALE_TIMEOUT,
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
-    REPORT_TIMEOUT_SECONDS,
+    STALE_ACTIONS,
 )
 from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.capture import CaptureWriter, capture_directory, export_archive, list_captures, read_manifest
@@ -68,6 +73,8 @@ from .pytap.core.events import (
 from .pytap.core.state import PersistentState
 
 _LOGGER = logging.getLogger(__name__)
+
+type PyTapConfigEntry = ConfigEntry[PyTapDataUpdateCoordinator]
 
 STORE_VERSION = 2
 SAVE_DELAY_SECONDS = 10
@@ -112,6 +119,10 @@ _SNAPSHOT_FIELDS = (
 )
 
 
+def _daily_reset_fields(today: str) -> dict[str, Any]:
+    return {"daily_energy_wh": 0.0, "readings_today": 0, "daily_reset_date": today}
+
+
 def reading_faults(event: PowerReportEvent) -> list[str]:
     """Return why a power report is physically impossible (empty if plausible)."""
     faults: list[str] = []
@@ -146,6 +157,11 @@ class _MigratingStore(Store):
         return old_data
 
 
+def coordinator_store(hass: HomeAssistant, entry_id: str) -> Store:
+    """The single persisted state file for one config entry."""
+    return _MigratingStore(hass, STORE_VERSION, f"pytap_{entry_id}_coordinator")
+
+
 class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Manage streaming data from the Tigo gateway via pytap parser.
 
@@ -178,6 +194,13 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (TypeError, ValueError):
             self._write_interval = float(DEFAULT_WRITE_INTERVAL)
         self._write_interval = max(0.0, self._write_interval)
+        stale_action = entry.data.get(CONF_STALE_ACTION, DEFAULT_STALE_ACTION)
+        self._stale_action: str = stale_action if stale_action in STALE_ACTIONS else DEFAULT_STALE_ACTION
+        try:
+            stale_timeout = int(entry.data.get(CONF_STALE_TIMEOUT, DEFAULT_STALE_TIMEOUT))
+        except (TypeError, ValueError):
+            stale_timeout = DEFAULT_STALE_TIMEOUT
+        self._stale_timeout: int = max(MIN_STALE_TIMEOUT, min(MAX_STALE_TIMEOUT, stale_timeout))
 
         # Build barcode allowlist from configured modules
         self._configured_barcodes: set[str] = {
@@ -201,6 +224,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Track barcodes seen on the bus but not in user config
         self._discovered_barcodes: set[str] = set()
+        # Barcodes skipped because another PyTap entry owns them (logged once).
+        self._foreign_barcodes: set[str] = set()
 
         # Counter for power reports dropped because barcode could not be
         # resolved.  Used to emit periodic INFO-level messages so operators
@@ -222,12 +247,15 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Flushed (time-weighted averaged) each time the write interval fires.
         self._reading_buffers: dict[str, list[tuple[float, dict[str, Any]]]] = {}
 
-        # Midnight reset timer handle
-        self._midnight_reset_unsub: asyncio.TimerHandle | None = None
+        # Midnight reset subscription
+        self._midnight_reset_unsub: CALLBACK_TYPE | None = None
 
         # Periodic check that marks panels unavailable once reports stop.
         self._freshness_unsub: CALLBACK_TYPE | None = None
         self._reporting_barcodes: frozenset[str] = frozenset()
+        # Per-barcode entity callbacks re-rendered when that panel's freshness
+        # changes, keyed by each registration's unsubscribe function.
+        self._freshness_listeners: dict[str, dict[CALLBACK_TYPE, CALLBACK_TYPE]] = {}
 
         # Active source handle; the worker owns open/read/close.
         self._source: Any = None
@@ -240,7 +268,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._capture_root = Path(hass.config.path("pytap_captures", entry.entry_id))
 
         # --- Persistence (single HA Store for all state) ---
-        self._store = _MigratingStore(hass, STORE_VERSION, f"pytap_{entry.entry_id}_coordinator")
+        self._store = coordinator_store(hass, entry.entry_id)
         self._unsaved_changes: bool = False
         self._save_task: asyncio.TimerHandle | None = None
 
@@ -249,14 +277,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Per-module energy accumulation state (persisted)
         self._energy_state: dict[str, EnergyAccumulator] = {}
+        self._store_loaded = False
 
-        # Initialize data structure
-        self.data: dict[str, Any] = {
+        # The listener thread owns ``_state``; Home Assistant only ever sees
+        # copies published to ``data`` on its event loop. ``_state_lock``
+        # guards ``_state``/``_energy_state`` against loop-side readers.
+        self._state_lock = threading.RLock()
+        self._state: dict[str, Any] = {
             "gateways": {},
             "nodes": {},
             "counters": {},
             "discovered_barcodes": [],
         }
+        self.data: dict[str, Any] = self._snapshot()
+
+    def _snapshot(self) -> dict[str, Any]:
+        """Copy the worker state for publication; node dicts are never shared."""
+        with self._state_lock:
+            return {
+                **self._state,
+                "gateways": dict(self._state["gateways"]),
+                "nodes": {barcode: dict(node) for barcode, node in self._state["nodes"].items()},
+                "counters": dict(self._state["counters"]),
+                "discovered_barcodes": list(self._state["discovered_barcodes"]),
+            }
+
+    def _publish(self, snapshot: dict[str, Any]) -> None:
+        """Hand a snapshot to Home Assistant's loop (callable from the worker)."""
+        self.hass.loop.call_soon_threadsafe(self.async_set_updated_data, snapshot)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Return current data (push-based, no polling needed)."""
@@ -285,16 +333,36 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (TypeError, ValueError):
             return 0
 
+    @property
+    def store_loaded(self) -> bool:
+        """Saved state (including discovered modules) was read successfully."""
+        return self._store_loaded
+
+    @property
+    def stale_action(self) -> str:
+        """What live readings do once a panel stops reporting."""
+        return self._stale_action
+
+    @property
+    def stale_timeout(self) -> int:
+        """Seconds without a valid report before a panel counts as stale."""
+        return self._stale_timeout
+
     def seconds_since_report(self, barcode: str) -> float | None:
-        """Seconds since this session's last valid power report, if any."""
+        """Seconds since the published data's last valid report, if any this session."""
         node = self.data.get("nodes", {}).get(barcode)
         reported = node.get("report_monotonic") if node else None
         return None if reported is None else time.monotonic() - reported
 
     def is_reporting(self, barcode: str) -> bool:
-        """Whether live readings are current (a valid report within the timeout)."""
+        """Whether live readings are current (a valid report within the timeout).
+
+        Averaged mode publishes at most once per interval, so the interval is
+        added to the allowance; otherwise panels would flap between flushes.
+        """
         age = self.seconds_since_report(barcode)
-        return age is not None and age < REPORT_TIMEOUT_SECONDS
+        allowance = self._stale_timeout + (0 if self._live_reporting else self._write_interval)
+        return age is not None and age < allowance
 
     def _current_reporting(self) -> frozenset[str]:
         return frozenset(
@@ -308,12 +376,47 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._reporting_barcodes = self._current_reporting()
 
     @callback
+    def async_add_freshness_listener(
+        self, barcodes: list[str], update_callback: CALLBACK_TYPE
+    ) -> CALLBACK_TYPE:
+        """Call ``update_callback`` when any of ``barcodes`` starts or stops reporting."""
+        watched = frozenset(barcodes)
+
+        @callback
+        def remove_listener() -> None:
+            for barcode in watched:
+                if (listeners := self._freshness_listeners.get(barcode)) is not None:
+                    listeners.pop(remove_listener, None)
+                    if not listeners:
+                        del self._freshness_listeners[barcode]
+
+        for barcode in watched:
+            self._freshness_listeners.setdefault(barcode, {})[remove_listener] = update_callback
+        return remove_listener
+
+    @callback
     def _async_check_freshness(self, _now: datetime | None = None) -> None:
-        """Refresh entities when a panel starts or stops reporting."""
+        """Re-render only entities of panels that started or stopped reporting."""
         reporting = self._current_reporting()
-        if reporting != self._reporting_barcodes:
-            self._reporting_barcodes = reporting
-            self.async_update_listeners()
+        changed = reporting ^ self._reporting_barcodes
+        if not changed:
+            return
+        self._reporting_barcodes = reporting
+        # One call per registration, even if several of its panels changed.
+        affected: dict[CALLBACK_TYPE, CALLBACK_TYPE] = {}
+        for barcode in changed:
+            affected.update(self._freshness_listeners.get(barcode, {}))
+        for update_callback in affected.values():
+            update_callback()
+
+    def _owned_by_other_entry(self, barcode: str) -> bool:
+        """Another PyTap entry (e.g. on the same bus) already tracks this optimizer."""
+        return any(
+            entry.entry_id != self.config_entry.entry_id
+            and isinstance(other := getattr(entry, "runtime_data", None), PyTapDataUpdateCoordinator)
+            and barcode in other._configured_barcodes
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+        )
 
     def _add_discovered_module(
         self, barcode: str, node_id: int | None = None, restored: dict[str, Any] | None = None
@@ -327,6 +430,11 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if barcode in self._configured_barcodes or barcode in self._excluded_barcodes:
             return False
         if not self._auto_discovery and restored is None:
+            return False
+        if self._owned_by_other_entry(barcode):
+            if barcode not in self._foreign_barcodes:
+                self._foreign_barcodes.add(barcode)
+                _LOGGER.info("Not tracking %s: another PyTap entry already tracks it", barcode)
             return False
         module = {
             CONF_MODULE_BARCODE: barcode,
@@ -351,7 +459,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         payload = self._build_node_payload(barcode, module, node_id)
         if acc := self._energy_state.get(barcode):
             self._merge_energy_into_node(payload, acc)
-        self.data["nodes"].setdefault(barcode, payload)
+        self._state["nodes"].setdefault(barcode, payload)
         self._schedule_save()
         _LOGGER.info("Automatically tracking Tigo optimizer %s", barcode)
         return True
@@ -395,26 +503,26 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def capture_status(self) -> dict[str, Any]:
-        """Only counters and paths in diagnostics; never captured packet data."""
+        """Diagnostics-safe counters: no local paths and never captured packet data."""
         return self._capture.status() if self._capture is not None else {"state": "idle"}
 
     async def async_start_capture(
         self, duration_minutes: int = 1440, max_storage_mib: int = 1024
     ) -> dict[str, Any]:
         """Record the active source without opening another port or bus writes."""
+        from .pytap.core.capture import CaptureError
+
         async with self._capture_lock:
             if self._stop_event.is_set():
-                raise ValueError("Listener is not running")
-            if (
-                (self._capture is not None and self._capture.busy)
-                or (self._capture_start_future is not None and not self._capture_start_future.done())
-                or (self._capture_export_future is not None and not self._capture_export_future.done())
-            ):
-                raise ValueError("A capture or export is already running or stopping")
+                raise CaptureError("listener_not_running", "Listener is not running")
+            if self._capture_writer_running() or self._capture_job_running():
+                raise CaptureError("capture_busy", "A capture or export is already running or stopping")
             if type(duration_minutes) is not int or not 1 <= duration_minutes <= 10080:
-                raise ValueError("Duration must be 1–10080 minutes")
+                raise CaptureError(
+                    "invalid_duration", "Duration must be 1–10080 minutes", min="1", max="10080"
+                )
             if type(max_storage_mib) is not int or not 16 <= max_storage_mib <= 4096:
-                raise ValueError("Storage must be 16–4096 MiB")
+                raise CaptureError("invalid_storage", "Storage must be 16–4096 MiB", min="16", max="4096")
             source = {CONF_CONNECTION_TYPE: self._connection[CONF_CONNECTION_TYPE]}
             if CONF_BAUD_RATE in self._connection:
                 source.update(
@@ -442,7 +550,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 writer.request_stop("start_cancelled")
                 raise
             writer.mark("capture_started", self._connection_generation, connected=self._connected)
-            return writer.status()
+            return writer.status(include_directory=True)
 
     async def async_stop_capture(self, reason: str = "user") -> dict[str, Any]:
         """Drain/flush in the executor, preserving evidence on stop and reload."""
@@ -461,45 +569,96 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self.hass.async_add_executor_job(writer.join, 10)
             except TimeoutError:
                 _LOGGER.error("Capture writer is still stopping")
-            return writer.status()
+            return writer.status(include_directory=True)
 
     async def async_list_captures(self) -> list[dict[str, Any]]:
         return await self.hass.async_add_executor_job(list_captures, self._capture_root)
 
     async def async_capture_info(self, capture_id: str | None = None) -> dict[str, Any]:
         if capture_id is None or (self._capture is not None and capture_id == self._capture.capture_id):
-            return self.capture_status
+            return self._capture_service_status()
 
         def info() -> dict[str, Any]:
-            manifest = read_manifest(capture_directory(self._capture_root, capture_id), allow_incomplete=True)
-            return {key: value for key, value in manifest.items() if key not in ("metadata", "segments")}
+            directory = capture_directory(self._capture_root, capture_id)
+            manifest = read_manifest(directory, allow_incomplete=True)
+            hidden = ("metadata", "segments", "events", "directory")
+            return {
+                **{key: value for key, value in manifest.items() if key not in hidden},
+                "directory": str(directory),
+            }
 
         return await self.hass.async_add_executor_job(info)
 
-    async def async_export_capture(self, capture_id: str | None = None) -> dict[str, Any]:
+    async def async_export_capture(
+        self, capture_id: str | None = None, max_storage_mib: int | None = None
+    ) -> dict[str, Any]:
+        """Archive off the loop; the job future, not the lock, marks the export busy."""
+        from .pytap.core.capture import CaptureError
+
         async with self._capture_lock:
             capture_id = capture_id or (self._capture.capture_id if self._capture is not None else None)
             if capture_id is None:
-                raise ValueError("Select a stopped capture ID")
-            if (
-                (self._capture is not None and self._capture.busy)
-                or (self._capture_start_future is not None and not self._capture_start_future.done())
-                or (self._capture_export_future is not None and not self._capture_export_future.done())
-            ):
-                raise ValueError("Stop capture before exporting")
+                raise CaptureError("capture_id_required", "Select a stopped capture ID")
+            if self._capture_writer_running():
+                raise CaptureError("stop_before_export", "Stop capture before exporting")
+            if self._capture_job_running():
+                raise CaptureError("capture_busy", "A capture or export is already running or stopping")
+            if max_storage_mib is None:
+                budget = self._capture.max_storage_bytes if self._capture is not None else 1024 * 1024 * 1024
+            elif type(max_storage_mib) is not int or not 16 <= max_storage_mib <= 4096:
+                raise CaptureError("invalid_storage", "Storage must be 16–4096 MiB", min="16", max="4096")
+            else:
+                budget = max_storage_mib * 1024 * 1024
 
             def export() -> str:
                 return str(
-                    export_archive(capture_directory(self._capture_root, capture_id), allow_interrupted=True)
+                    export_archive(
+                        capture_directory(self._capture_root, capture_id),
+                        allow_interrupted=True,
+                        max_storage_bytes=budget,
+                    )
                 )
 
-            self._capture_export_future = self.hass.async_add_executor_job(export)
-            archive = await asyncio.shield(self._capture_export_future)
-            return {
-                "capture_id": capture_id,
-                "archive": archive,
-                "note": "Private local file; not exposed over HTTP",
-            }
+            future = self._capture_export_future = self.hass.async_add_executor_job(export)
+        # Released so stop/unload never wait for a long export; start/delete see the busy future.
+        archive = await asyncio.shield(future)
+        return {
+            "capture_id": capture_id,
+            "archive": archive,
+            "note": "Private local file; not exposed over HTTP",
+        }
+
+    async def async_delete_capture(self, capture_id: str) -> dict[str, Any]:
+        """Delete one stopped capture and its exports; never the active session."""
+        from .pytap.core.capture import CaptureError, delete_capture
+
+        async with self._capture_lock:
+            if self._capture is not None and capture_id == self._capture.capture_id:
+                if self._capture_writer_running():
+                    raise CaptureError("capture_active", "Stop the active capture before deleting it")
+            if self._capture_job_running():
+                raise CaptureError("capture_busy", "A capture or export is already running or stopping")
+            future = self._capture_export_future = self.hass.async_add_executor_job(
+                delete_capture, self._capture_root, capture_id
+            )
+        result = await asyncio.shield(future)
+        if self._capture is not None and capture_id == self._capture.capture_id:
+            self._capture = None
+        return result
+
+    def _capture_service_status(self) -> dict[str, Any]:
+        """Admin action responses also include the private local directory."""
+        if self._capture is None:
+            return {"state": "idle"}
+        return self._capture.status(include_directory=True)
+
+    def _capture_job_running(self) -> bool:
+        return self._capture_export_future is not None and not self._capture_export_future.done()
+
+    def _capture_writer_running(self) -> bool:
+        return (self._capture is not None and self._capture.busy) or (
+            self._capture_start_future is not None and not self._capture_start_future.done()
+        )
 
     async def async_start_listener(self) -> None:
         """Start the background listener task."""
@@ -531,10 +690,24 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await asyncio.shield(self._worker_future)
         finally:
             self._stop_event.set()
+            if self._capture is not None:
+                # Nothing more can be recorded; let the writer finalise its files.
+                self._capture.request_stop("listener_stopped")
+
+    def _interrupt_source(self) -> None:
+        """Wake a read blocked on an idle TCP socket so the worker sees the stop."""
+        with self._source_lock:
+            source = self._source
+        if (interrupt := getattr(source, "interrupt", None)) is not None:
+            try:
+                interrupt()
+            except Exception as err:
+                _LOGGER.debug("Source interrupt failed (%s)", type(err).__name__)
 
     async def async_stop_listener(self) -> bool:
         """Bound the entire shutdown, including both controller lock waits."""
         self._stop_event.set()
+        self._interrupt_source()
         if self._capture is not None:
             # Disarm a preparing writer even when startup/export holds the lock.
             self._capture.request_stop("unload")
@@ -575,14 +748,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # failure must not prevent timer/state cleanup during unload.
                 _LOGGER.error("PyTap listener exited with %s", type(err).__name__)
             await self.async_stop_capture("unload")
-            if self._capture_export_future is not None:
-                try:
-                    async with asyncio.timeout(LISTENER_STOP_TIMEOUT):
-                        await asyncio.shield(self._capture_export_future)
-                except TimeoutError:
-                    return False
-                except Exception:
-                    pass  # Export errors do not own the source port.
+            # A running export doesn't own the port: let it finish in the
+            # executor instead of failing (and blocking) unload or reload.
             if (self._capture is not None and self._capture.busy) or (
                 self._capture_start_future is not None and not self._capture_start_future.done()
             ):
@@ -590,7 +757,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._listener_task = None
             self._worker_future = None
             if self._midnight_reset_unsub is not None:
-                self._midnight_reset_unsub.cancel()
+                self._midnight_reset_unsub()
                 self._midnight_reset_unsub = None
             if self._freshness_unsub is not None:
                 self._freshness_unsub()
@@ -603,41 +770,38 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
 
     def _schedule_midnight_reset(self) -> None:
-        """Schedule a callback at the next local midnight to reset daily accumulators."""
-        now = dt_util.now()
-        next_midnight = datetime.combine(now.date() + timedelta(days=1), dt_time.min, tzinfo=now.tzinfo)
-        delay = (next_midnight - now).total_seconds()
-        self._midnight_reset_unsub = self.hass.loop.call_later(delay, self._perform_midnight_reset)
-        _LOGGER.debug("Scheduled daily reset in %.0f seconds (at %s)", delay, next_midnight)
+        """Reset daily accumulators at every local midnight (DST-safe)."""
+        self._midnight_reset_unsub = async_track_time_change(
+            self.hass, self._perform_midnight_reset, hour=0, minute=0, second=0
+        )
 
     @callback
-    def _perform_midnight_reset(self) -> None:
+    def _perform_midnight_reset(self, _now: datetime | None = None) -> None:
         """Reset all daily accumulators and push updated data to sensors."""
-        self._midnight_reset_unsub = None
         today = dt_util.now().date().isoformat()
         _LOGGER.info("Midnight daily reset — resetting daily accumulators for %s", today)
 
-        data_changed = False
-        for barcode, acc in dict(self._energy_state).items():
-            if acc.daily_reset_date == today:
-                continue
-            acc.daily_energy_wh = 0.0
-            acc.readings_today = 0
-            acc.daily_reset_date = today
+        reset: set[str] = set()
+        with self._state_lock:
+            for barcode, acc in dict(self._energy_state).items():
+                if acc.daily_reset_date == today:
+                    continue
+                acc.daily_energy_wh = 0.0
+                acc.readings_today = 0
+                acc.daily_reset_date = today
+                if (node := self._state["nodes"].get(barcode)) is not None:
+                    self._state["nodes"][barcode] = {**node, **_daily_reset_fields(today)}
+                    reset.add(barcode)
 
-            node_data = self.data.get("nodes", {}).get(barcode)
-            if node_data is not None:
-                node_data["daily_energy_wh"] = 0.0
-                node_data["readings_today"] = 0
-                node_data["daily_reset_date"] = today
-                data_changed = True
-
-        if data_changed:
+        if reset:
             self._schedule_save()
-            self.async_set_updated_data(dict(self.data))
-
-        # Re-schedule for the next midnight
-        self._schedule_midnight_reset()
+            # Reset the *published* values only, so averaged mode never shows
+            # raw mid-interval readings because of the reset.
+            nodes = {
+                barcode: {**node, **_daily_reset_fields(today)} if barcode in reset else node
+                for barcode, node in self.data.get("nodes", {}).items()
+            }
+            self.async_set_updated_data({**self.data, "nodes": nodes})
 
     def _listen(self) -> None:
         """Blocking listener loop (runs in executor thread).
@@ -667,7 +831,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._connection_generation += 1
                 if self._capture is not None:
                     self._capture.mark("connection_open", self._connection_generation)
-                _LOGGER.info("Connected to Tigo byte stream")
+                if retries:
+                    _LOGGER.info("Reconnected to Tigo byte stream after %d attempt(s)", retries)
+                else:
+                    _LOGGER.info("Connected to Tigo byte stream")
                 retries = 0
                 self._retries = 0
                 last_data_time = time.monotonic()
@@ -681,9 +848,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 data, self._connection_generation, self._persistent_state.to_dict
                             )
                         events = parser.feed(data)
-                        for event in events:
-                            if self._process_event(event):
-                                self._ha_update_pending = True
+                        with self._state_lock:
+                            for event in events:
+                                if self._process_event(event):
+                                    self._ha_update_pending = True
 
                         if self._live_reporting:
                             # Live mode — push every change immediately
@@ -713,7 +881,14 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 if self._stop_event.is_set():
                     return
-                _LOGGER.warning("Connection error (%s); retrying", type(err).__name__)
+                # Endpoints stay out of logs; errno is safe and useful. Log the
+                # loss once, then keep retrying quietly until it recovers.
+                errno = getattr(err, "errno", None)
+                detail = f"{type(err).__name__}" + (f", errno {errno}" if errno is not None else "")
+                if retries == 0:
+                    _LOGGER.warning("Tigo byte stream unavailable (%s); retrying", detail)
+                else:
+                    _LOGGER.debug("Connection attempt failed (%s)", detail)
             finally:
                 self._connected = False
                 try:
@@ -739,7 +914,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.error("Max retries (%d) exceeded", RECONNECT_RETRIES)
                 return
 
-            _LOGGER.info(
+            _LOGGER.debug(
                 "Reconnecting in %ds (attempt %d/%s)...",
                 RECONNECT_DELAY,
                 retries,
@@ -757,25 +932,21 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             snapshot = self._build_averaged_snapshot(time.monotonic())
             self._reading_buffers.clear()
         else:
-            snapshot = {**self.data, "nodes": dict(self.data["nodes"])}
-        self.hass.loop.call_soon_threadsafe(self.async_set_updated_data, snapshot)
+            snapshot = self._snapshot()
+        self._publish(snapshot)
         self._ha_update_pending = False
 
     def _push_live_update(self, parser: Any) -> None:
         """Push an immediate snapshot to HA (live reporting mode).
 
-        Publishes an *immutable* copy of the ``nodes`` mapping so the listener
-        thread can keep mutating ``self.data["nodes"]`` without HA-side
-        consumers (sensors, diagnostics) ever iterating a dict that changes
-        size mid-read.  Runs in the executor thread.
+        Publishes a copy of every node so the listener thread never mutates
+        data Home Assistant is reading. Runs in the executor thread.
         """
         if not self._ha_update_pending:
             return
-        self.data["counters"] = parser.counters
-        self.hass.loop.call_soon_threadsafe(
-            self.async_set_updated_data,
-            {**self.data, "nodes": dict(self.data["nodes"])},
-        )
+        with self._state_lock:
+            self._state["counters"] = parser.counters
+        self._publish(self._snapshot())
         self._ha_update_pending = False
 
     def _maybe_flush_interval(self, parser: Any, now: float) -> None:
@@ -788,8 +959,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if not self._ha_update_pending or (now - self._last_ha_update < self._write_interval):
             return
-        self.data["counters"] = parser.counters
-        snapshot = self._build_averaged_snapshot(now)
+        with self._state_lock:
+            self._state["counters"] = parser.counters
+            snapshot = self._build_averaged_snapshot(now)
         per_node_counts = {
             barcode: len(readings)
             for barcode, readings in self._reading_buffers.items()
@@ -803,10 +975,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
         )
         self._reading_buffers.clear()
-        self.hass.loop.call_soon_threadsafe(
-            self.async_set_updated_data,
-            snapshot,
-        )
+        self._publish(snapshot)
         self._last_ha_update = now
         self._ha_update_pending = False
 
@@ -856,6 +1025,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Returns True if coordinator data was modified (triggers HA update).
         """
+        with self._state_lock:
+            return self._process_event_locked(event)
+
+    def _process_event_locked(self, event: Event) -> bool:
         if isinstance(event, PowerReportEvent):
             return self._handle_power_report(event)
         if isinstance(event, InfrastructureEvent):
@@ -923,7 +1096,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             discovered_changed = False
             if barcode not in self._discovered_barcodes:
                 self._discovered_barcodes.add(barcode)
-                self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+                self._state["discovered_barcodes"] = sorted(self._discovered_barcodes)
                 self._schedule_save()
                 discovered_changed = True
                 _LOGGER.info(
@@ -939,7 +1112,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Get module metadata
         module_meta = self._module_lookup.get(barcode, {})
-        previous = self.data["nodes"].get(barcode)
+        previous = self._state["nodes"].get(barcode)
         now = dt_util.now()
 
         if faults := reading_faults(event):
@@ -959,7 +1132,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     event.temperature,
                 )
             node.update(reading_fault=True, fault_reasons=faults, last_fault_at=now.isoformat())
-            self.data["nodes"][barcode] = node
+            self._state["nodes"][barcode] = node
             self._schedule_save()
             return True
 
@@ -985,7 +1158,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 barcode,
             )
 
-        self.data["nodes"][barcode] = {
+        self._state["nodes"][barcode] = {
             "gateway_id": event.gateway_id,
             "node_id": event.node_id,
             "barcode": barcode,
@@ -1014,6 +1187,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "last_update": now.isoformat(),
             "report_monotonic": time.monotonic(),
         }
+        if previous is not None and "topology" in previous:
+            self._state["nodes"][barcode]["topology"] = previous["topology"]
         # Only buffer readings in interval/averaged mode.  In live mode the
         # raw values are pushed immediately, so buffering would grow without
         # bound and never be consumed.
@@ -1021,7 +1196,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._reading_buffers.setdefault(barcode, []).append(
                 (
                     time.monotonic(),
-                    {field: self.data["nodes"][barcode][field] for field in _AVERAGED_FIELDS},
+                    {field: self._state["nodes"][barcode][field] for field in _AVERAGED_FIELDS},
                 )
             )
         self._schedule_save()
@@ -1056,7 +1231,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._infra_received = True
 
         # Update gateways
-        self.data["gateways"] = event.gateways
+        self._state["gateways"] = event.gateways
 
         # Rebuild barcode ↔ node_id mappings from scratch
         new_barcode_to_node: dict[str, int] = {}
@@ -1081,7 +1256,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._add_discovered_module(barcode, node_id)
 
         if discovered_changed:
-            self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+            self._state["discovered_barcodes"] = sorted(self._discovered_barcodes)
 
         # When the event has no nodes, preserve existing coordinator
         # mappings — they may have been loaded from saved state and are
@@ -1160,9 +1335,10 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         barcode = self._node_to_barcode.get(event.node_id)
         if barcode and barcode in self._configured_barcodes:
-            node_data = self.data["nodes"].get(barcode)
+            node_data = self._state["nodes"].get(barcode)
             if node_data:
-                node_data["topology"] = event.to_dict()
+                # Replace rather than mutate: saves may be copying this dict.
+                self._state["nodes"][barcode] = {**node_data, "topology": event.to_dict()}
                 return True
         return False
 
@@ -1175,7 +1351,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         For each barcode in ``_reading_buffers``, computes a **time-weighted
         average** of numeric readings and writes the result into a copy of
-        the node dict.  ``self.data["nodes"]`` is **not** mutated — the raw
+        the node dict.  ``self._state["nodes"]`` is **not** mutated — the raw
         latest values are preserved there for persistence; only the returned
         snapshot carries averaged values.
 
@@ -1188,7 +1364,16 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Must be called before ``_reading_buffers`` is cleared.
         """
-        snapshot_nodes = dict(self.data["nodes"])
+        base = self._snapshot()
+        snapshot_nodes = base["nodes"]
+        published = self.data.get("nodes", {})
+        for barcode, node in snapshot_nodes.items():
+            # No new reading this interval: keep the previously published
+            # averages, but take status/energy/fault fields from the worker.
+            if not self._reading_buffers.get(barcode) and (old := published.get(barcode)) is not None:
+                for field in (*_AVERAGED_FIELDS, "performance"):
+                    if field in old:
+                        node[field] = old[field]
         for barcode, readings in self._reading_buffers.items():
             node = snapshot_nodes.get(barcode)
             if node is None or not readings:
@@ -1229,7 +1414,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 avg_node["performance"] = None
             snapshot_nodes[barcode] = avg_node
-        return {**self.data, "nodes": snapshot_nodes}
+        return {**base, "nodes": snapshot_nodes}
 
     def _build_node_payload(
         self,
@@ -1257,7 +1442,8 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "high_output_mode": None,
             "status_code": None,
             "low_voltage_flag": None,
-            "reading_fault": False,
+            # Unknown until the first report: no reading yet is not "no fault".
+            "reading_fault": None,
             "fault_reasons": [],
             "last_fault_at": None,
             "daily_energy_wh": 0.0,
@@ -1289,15 +1475,20 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         node_payload["daily_reset_date"] = acc.daily_reset_date
 
     async def _async_load_coordinator_state(self) -> None:
-        """Load all persisted state (barcode mappings, discovered barcodes, parser state) from HA Store."""
+        """Load persisted state, then publish it before any entity is created."""
         try:
             stored = await self._store.async_load()
         except Exception:
             _LOGGER.debug("No stored coordinator state found")
-            stored = None
+        else:
+            self._store_loaded = True
+            if stored is not None:
+                with self._state_lock:
+                    self._apply_stored_state(stored)
+        self.data = self._snapshot()
 
-        if stored is None:
-            return
+    def _apply_stored_state(self, stored: dict[str, Any]) -> None:
+        """Restore mappings, discoveries, parser state, energy and node snapshots."""
 
         # Restore discovery metadata before node snapshots. The config entry's
         # explicit list overrides it, including user-edited names/groupings/Wp.
@@ -1318,7 +1509,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Restore discovered barcodes
         discovered = stored.get("discovered_barcodes", [])
         self._discovered_barcodes = set(discovered)
-        self.data["discovered_barcodes"] = sorted(self._discovered_barcodes)
+        self._state["discovered_barcodes"] = sorted(self._discovered_barcodes)
         # Turning discovery on can admit barcodes learned in previous manual
         # sessions, without waiting for another node-table broadcast.
         for barcode in self._discovered_barcodes:
@@ -1386,7 +1577,7 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 round(max(power, 0) / peak * 100, 2) if power is not None and peak > 0 else None
             )
 
-            self.data["nodes"][barcode] = node_payload
+            self._state["nodes"][barcode] = node_payload
 
         _LOGGER.info(
             "Restored coordinator state: %d barcode mappings, %d discovered barcodes, "
@@ -1401,36 +1592,34 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_save_coordinator_state(self) -> None:
         """Save all state (barcode mappings, discovered barcodes, parser state) to HA Store."""
         self._unsaved_changes = False
-        # Discovery can grow these catalogues in the parser worker while HA
-        # prepares a save. Iterate fixed-size copies rather than live mappings.
-        barcode_to_node = dict(self._barcode_to_node)
-        energy_state = dict(self._energy_state)
-        nodes = dict(self.data["nodes"])
-        configured_barcodes = self._configured_barcodes.copy()
-        data = {
-            "auto_modules": list(dict(self._auto_modules).values()),
-            "barcode_to_node": barcode_to_node,
-            "discovered_barcodes": sorted(self._discovered_barcodes),
-            "parser_state": self._persistent_state.to_dict(),
-            "energy_data": {
-                barcode: {
-                    "daily_energy_wh": acc.daily_energy_wh,
-                    "daily_reset_date": acc.daily_reset_date,
-                    "total_energy_wh": acc.total_energy_wh,
-                    "readings_today": acc.readings_today,
-                    "last_power_w": acc.last_power_w,
-                    "last_reading_ts": (
-                        acc.last_reading_ts.isoformat() if acc.last_reading_ts is not None else None
-                    ),
-                }
-                for barcode, acc in energy_state.items()
-            },
-            "node_snapshots": {
-                barcode: {key: value for key, value in node.items() if key in _SNAPSHOT_FIELDS}
-                for barcode, node in nodes.items()
-                if barcode in configured_barcodes and isinstance(node, dict)
-            },
-        }
+        # Serialise under the state lock so the worker can't change nodes or
+        # accumulators mid-copy; the Store write itself happens outside it.
+        with self._state_lock:
+            configured_barcodes = self._configured_barcodes.copy()
+            data = {
+                "auto_modules": [dict(module) for module in self._auto_modules.values()],
+                "barcode_to_node": dict(self._barcode_to_node),
+                "discovered_barcodes": sorted(self._discovered_barcodes),
+                "parser_state": self._persistent_state.to_dict(),
+                "energy_data": {
+                    barcode: {
+                        "daily_energy_wh": acc.daily_energy_wh,
+                        "daily_reset_date": acc.daily_reset_date,
+                        "total_energy_wh": acc.total_energy_wh,
+                        "readings_today": acc.readings_today,
+                        "last_power_w": acc.last_power_w,
+                        "last_reading_ts": (
+                            acc.last_reading_ts.isoformat() if acc.last_reading_ts is not None else None
+                        ),
+                    }
+                    for barcode, acc in self._energy_state.items()
+                },
+                "node_snapshots": {
+                    barcode: {key: value for key, value in node.items() if key in _SNAPSHOT_FIELDS}
+                    for barcode, node in self._state["nodes"].items()
+                    if barcode in configured_barcodes and isinstance(node, dict)
+                },
+            }
         try:
             await self._store.async_save(data)
         except Exception:
@@ -1464,50 +1653,3 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Execute the scheduled save and clear the timer handle."""
         self._save_task = None
         await self._async_save_coordinator_state()
-
-    def reload_modules(self, modules: list[dict[str, Any]]) -> None:
-        """Reload the module configuration (called from options flow).
-
-        After updating the allowlist, checks whether any newly-configured
-        barcodes already have a known node mapping from a previous
-        infrastructure event.  If so, a placeholder entry is created in
-        coordinator data so sensor entities can bind immediately instead
-        of waiting for the next power report.
-        """
-        old_configured = set(self._configured_barcodes)
-        self._modules = modules
-        self._configured_barcodes = {m[CONF_MODULE_BARCODE] for m in modules if m.get(CONF_MODULE_BARCODE)}
-        self._module_lookup = {m[CONF_MODULE_BARCODE]: m for m in modules if m.get(CONF_MODULE_BARCODE)}
-
-        newly_added = self._configured_barcodes - old_configured
-        already_resolved = newly_added & set(self._barcode_to_node)
-        not_yet_resolved = newly_added - set(self._barcode_to_node)
-
-        # Pre-populate node data for newly added barcodes that already
-        # have a known node mapping so sensors can start immediately.
-        for barcode in already_resolved:
-            if barcode not in self.data["nodes"]:
-                module_meta = self._module_lookup.get(barcode, {})
-                now = dt_util.now()
-                acc = self._energy_state.setdefault(
-                    barcode,
-                    EnergyAccumulator(daily_reset_date=now.date().isoformat()),
-                )
-                payload = self._build_node_payload(barcode, module_meta, self._barcode_to_node[barcode])
-                self._merge_energy_into_node(payload, acc)
-                self.data["nodes"][barcode] = payload
-
-        _LOGGER.info(
-            "Reloaded module config: tracking %d barcodes",
-            len(self._configured_barcodes),
-        )
-        if already_resolved:
-            _LOGGER.info(
-                "Newly added barcodes already resolved from saved mappings: %s",
-                ", ".join(sorted(already_resolved)),
-            )
-        if not_yet_resolved:
-            _LOGGER.info(
-                "Newly added barcodes not yet in node table (will resolve on next infrastructure event): %s",
-                ", ".join(sorted(not_yet_resolved)),
-            )

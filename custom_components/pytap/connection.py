@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine, Mapping
 import logging
+import os
 import posixpath
 import re
 from typing import Any, Protocol, TypeVar
@@ -111,7 +112,9 @@ def normalize_connection(data: Mapping[str, Any]) -> dict[str, Any]:
             valid = False
         if not valid:
             raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
-    elif not endpoint.startswith("/") or "\x00" in endpoint:
+    elif not endpoint.startswith("/dev/") or "\x00" in endpoint:
+        # Only device nodes: never open arbitrary files (e.g. config) or
+        # special devices outside /dev as a "serial port".
         raise InvalidConnectionSettings(CONF_SERIAL_PORT, "invalid_serial_port")
     baud_rate = data.get(CONF_BAUD_RATE, DEFAULT_BAUD_RATE)
     if type(baud_rate) is not int or not 1 <= baud_rate <= 4_000_000:
@@ -138,6 +141,12 @@ def serial_endpoint_key(endpoint: str) -> str | tuple[str, tuple[tuple[str, str]
         parsed = urlsplit(endpoint)
         return parsed.path, tuple(sorted(parse_qsl(parsed.query)))
     return posixpath.normpath(endpoint)
+
+
+def resolved_endpoint_key(endpoint: str) -> str | tuple[str, tuple[tuple[str, str], ...]]:
+    """Like serial_endpoint_key, but resolves symlinks (blocking: run in an executor)."""
+    key = serial_endpoint_key(endpoint)
+    return os.path.realpath(key) if isinstance(key, str) else key
 
 
 class SerialProxySource:
@@ -178,7 +187,14 @@ class SerialProxySource:
         if on_loop:
             coro.close()
             raise RuntimeError("Serial source must run in an executor")
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            # Every coroutine is itself bounded; this only guards against a
+            # stopped event loop leaving the worker waiting forever.
+            return future.result(timeout=CONNECTION_TIMEOUT + 5)
+        except TimeoutError:
+            future.cancel()
+            raise
 
     async def _async_connect(self) -> None:
         async with asyncio.timeout(CONNECTION_TIMEOUT):

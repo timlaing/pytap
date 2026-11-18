@@ -90,6 +90,8 @@ class _Counters:
     runts: int = 0
     giants: int = 0
     noise_bytes: int = 0
+    # Slot counters outside 0..MAX_SLOT_NUMBER (corrupt or unknown encoding).
+    invalid_slots: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -437,16 +439,19 @@ class Parser:
         if offset + 2 > len(payload):
             return []
         slot_counter = SlotCounter.from_bytes(payload[offset : offset + 2])
-        if slot_counter.slot_number > MAX_SLOT_NUMBER:
-            return []  # Keep raw evidence, but never index an invalid slot clock.
         offset += 2
 
         # Update stored packet number
         self._rx_packet_numbers[gw_id] = packet_number
 
-        # Update slot clock
+        # Update slot clock. An invalid header counter must never index the
+        # clock, but the packets in this frame are still parsed: power reports
+        # carry their own slot counters and are checked individually.
         capture_time = self._captured_slot_times.pop(gw_id, None)
-        if capture_time is not None:
+        if slot_counter.slot_number > MAX_SLOT_NUMBER:
+            self._counters.invalid_slots += 1
+            logger.debug("Receive response gw=%d: invalid slot counter 0x%04X", gw_id, slot_counter.raw)
+        elif capture_time is not None:
             if gw_id in self._slot_clocks:
                 self._slot_clocks[gw_id].set(slot_counter, capture_time)
             else:
@@ -689,6 +694,9 @@ class Parser:
             return []
 
         if report.slot_counter.slot_number > MAX_SLOT_NUMBER:
+            # No valid timestamp can be derived for this measurement.
+            self._counters.invalid_slots += 1
+            logger.debug("Power report gw=%d node=%d: invalid slot counter, dropped", gw_id, node_id)
             return []
         slot_clock = self._slot_clocks.get(gw_id)
         if slot_clock is None:

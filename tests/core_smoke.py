@@ -34,8 +34,7 @@ class CoreSmoke(unittest.IsolatedAsyncioTestCase):
     """Exercise native Core config entries, schemas, and executor bridging."""
 
     async def asyncSetUp(self):
-        Path(".opencode").mkdir(exist_ok=True)
-        self.directory = TemporaryDirectory(dir=".opencode", prefix="core-smoke-")
+        self.directory = TemporaryDirectory(prefix="pytap-core-smoke-")
         self.hass = HomeAssistant(str(Path(self.directory.name).resolve()))
         self.hass.config_entries = ConfigEntries(self.hass, {})
 

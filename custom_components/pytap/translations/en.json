@@ -45,7 +45,9 @@
       "discovery": {
         "title": "Module Discovery",
         "description": "Automatically discover optimizers from passive bus traffic. No bus commands are sent. Names are based on barcodes, string grouping starts as Discovered, and rated panel power is unknown until edited. Turn this off to track only modules you add manually.",
-        "data": {"auto_discovery": "Automatically discover modules"}
+        "data": {
+          "auto_discovery": "Automatically discover modules"
+        }
       },
       "add_module": {
         "title": "Add Module",
@@ -68,15 +70,13 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the Tigo gateway. Check host and port.",
-      "invalid_auth": "Invalid authentication",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
       "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
       "missing_string": "String group is required.",
       "missing_name": "Module name is required.",
       "missing_barcode": "Barcode is required.",
       "duplicate_barcode": "This barcode has already been added.",
       "no_modules": "Manual mode requires at least one module. Add a module, or go back and enable automatic discovery.",
-      "unknown": "Unexpected error",
       "invalid_host": "Enter a hostname or IP address.",
       "invalid_port": "Enter a port between 1 and 65535.",
       "invalid_serial_port": "Choose a local absolute device path or a valid Home Assistant serial-proxy URL.",
@@ -84,9 +84,6 @@
       "invalid_connection_type": "Choose TCP or serial.",
       "serial_port_in_use": "Another PyTap entry already uses this serial port.",
       "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
-    },
-    "abort": {
-      "already_configured": "This gateway is already configured."
     }
   },
   "entity": {
@@ -186,17 +183,22 @@
           "change_discovery": "Change module discovery",
           "remove_module": "Remove a module",
           "done": "Save and close",
-          "change_reporting": "Change reporting settings"
+          "change_reporting": "Change reporting settings",
+          "change_stale": "Change stale reading behaviour"
         }
       },
       "change_discovery": {
         "title": "Module Discovery",
         "description": "Enable passive discovery of new optimizers. Disabling this stops adding new modules but keeps modules already discovered. Removed modules are ignored until explicitly added again. Save and close applies this setting.",
-        "data": {"auto_discovery": "Automatically discover modules"}
+        "data": {
+          "auto_discovery": "Automatically discover modules"
+        }
       },
       "edit_module": {
         "title": "Edit Module",
-        "data": {"barcode": "Select module"}
+        "data": {
+          "barcode": "Select module"
+        }
       },
       "module_details": {
         "title": "Module Details",
@@ -266,7 +268,7 @@
       },
       "change_reporting": {
         "title": "Reporting Settings",
-        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nTurn it off to cache readings and deliver a time-weighted average instead \u2014 you'll set the interval on the next screen. This reduces CPU and I/O load for installations with many panels.",
+        "description": "Configure how this integration delivers data to Home Assistant.\n\nWhen **Live reporting** is enabled (default), readings are pushed as they arrive from the gateway with sub-second latency.\n\nTurn it off to cache readings and deliver a time-weighted average instead — you'll set the interval on the next screen. This reduces CPU and I/O load for installations with many panels.",
         "data": {
           "live_reporting": "Live reporting"
         },
@@ -281,7 +283,19 @@
           "write_interval": "Reporting interval (seconds)"
         },
         "data_description": {
-          "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5\u2013300. Default: 30 seconds."
+          "write_interval": "How often (in seconds) to push time-weighted averaged updates to Home Assistant. Range: 5–300. Default: 30 seconds."
+        }
+      },
+      "change_stale": {
+        "title": "Stale Readings",
+        "description": "Choose what live panel readings (power, voltage, current, temperature, duty cycle, RSSI, performance and status) do when a panel stops sending valid reports, for example at night or during radio dropouts. Energy totals are not affected.",
+        "data": {
+          "stale_action": "When a panel stops reporting",
+          "stale_timeout": "Timeout (seconds)"
+        },
+        "data_description": {
+          "stale_action": "Unavailable: show readings as unavailable. Zero: report 0 for power, voltage, current and performance (other readings become unavailable). Hold: keep the last values, including after a restart.",
+          "stale_timeout": "How long without a valid report before a panel counts as stale (60–600 s). In averaged reporting mode the reporting interval is added."
         }
       }
     },
@@ -295,7 +309,70 @@
       "invalid_baud_rate": "Enter a baud rate between 1 and 4000000.",
       "invalid_connection_type": "Choose TCP or serial.",
       "serial_port_in_use": "Another PyTap entry already uses this serial port.",
-      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate."
+      "unsupported_serial_settings": "The serial backend does not support these settings. Check the selected port and baud rate.",
+      "cannot_connect": "Could not connect to this endpoint. Check the settings, or submit again to save them anyway and keep retrying in the background.",
+      "invalid_barcode": "Invalid barcode format. Expected format like A-1234567B.",
+      "duplicate_barcode": "This barcode has already been added.",
+      "missing_barcode": "Barcode is required."
+    }
+  },
+  "selector": {
+    "stale_action": {
+      "options": {
+        "unavailable": "Unavailable",
+        "zero": "Zero",
+        "hold": "Hold last value"
+      }
+    }
+  },
+  "exceptions": {
+    "previous_listener_stopping": {
+      "message": "The previous PyTap listener is still releasing its connection; setup will retry."
+    },
+    "invalid_connection_settings": {
+      "message": "The saved connection setting \"{field}\" is invalid. Update it with Configure → Change connection settings."
+    },
+    "capture_entry_not_loaded": {
+      "message": "Select a loaded PyTap config entry."
+    },
+    "capture_busy": {
+      "message": "A packet capture, export or deletion is already running or stopping."
+    },
+    "stop_before_export": {
+      "message": "Stop the packet capture before exporting it."
+    },
+    "capture_id_required": {
+      "message": "Select a stopped capture ID."
+    },
+    "invalid_capture_id": {
+      "message": "The capture ID is invalid."
+    },
+    "capture_not_found": {
+      "message": "Capture {capture_id} was not found."
+    },
+    "capture_active": {
+      "message": "Stop the active packet capture before deleting it."
+    },
+    "capture_unsafe": {
+      "message": "The capture contains unexpected files or links and was not changed."
+    },
+    "listener_not_running": {
+      "message": "The PyTap listener is not running."
+    },
+    "invalid_duration": {
+      "message": "Duration must be between {min} and {max} minutes."
+    },
+    "invalid_storage": {
+      "message": "Storage budget must be between {min} and {max} MiB."
+    },
+    "storage_budget_exhausted": {
+      "message": "No packet capture storage budget remains ({available_mib} MiB available). Delete old captures or raise the budget."
+    },
+    "export_budget_exceeded": {
+      "message": "Exporting needs about {required_mib} MiB but only {available_mib} MiB of the storage budget remains. Delete old captures or raise the budget."
+    },
+    "capture_failed": {
+      "message": "Packet capture action failed ({error}); check capture status and available storage."
     }
   }
 }

@@ -46,10 +46,17 @@ RECONNECT_RETRIES = 0
 ENERGY_GAP_THRESHOLD_SECONDS = 120
 ENERGY_LOW_POWER_THRESHOLD_W = 1.0
 
-# Live panel readings become unavailable after this long without a valid power
-# report. Captures showed normal gaps up to ~76 s and dawn start-up gaps up to
-# ~171 s; the CCA itself only uploads every 5 minutes.
-REPORT_TIMEOUT_SECONDS = 180
+# What live panel readings do once a panel stops sending valid reports.
+CONF_STALE_ACTION = "stale_action"
+CONF_STALE_TIMEOUT = "stale_timeout"
+STALE_ACTION_UNAVAILABLE = "unavailable"
+STALE_ACTION_ZERO = "zero"
+STALE_ACTION_HOLD = "hold"
+STALE_ACTIONS = (STALE_ACTION_UNAVAILABLE, STALE_ACTION_ZERO, STALE_ACTION_HOLD)
+DEFAULT_STALE_ACTION = STALE_ACTION_UNAVAILABLE
+DEFAULT_STALE_TIMEOUT = 120
+MIN_STALE_TIMEOUT = 60
+MAX_STALE_TIMEOUT = 600
 FRESHNESS_CHECK_INTERVAL_SECONDS = 5
 
 # Readings outside these bounds are treated as corrupt, not as measurements.

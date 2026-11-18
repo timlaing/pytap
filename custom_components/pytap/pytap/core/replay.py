@@ -8,11 +8,9 @@ from typing import Any
 
 from .capture import CapturedChunk
 from .crc import crc
-from .parser import Parser
+from .parser import _UNESCAPE_MAP, MAX_FRAME_SIZE, Parser
 from .state import PersistentState
 from .types import FrameType, PacketType, PowerReport
-
-_UNESCAPE = {0: 0x7E, 1: 0x24, 2: 0x23, 3: 0x25, 4: 0xA4, 5: 0xA3, 6: 0xA5}
 
 
 def _name(enum: type[FrameType] | type[PacketType], value: int) -> str:
@@ -80,12 +78,13 @@ def decode_wire_frame(wire: bytes) -> dict[str, Any]:
         byte = wire[offset]
         if byte == 0x7E:
             offset += 1
-            if offset >= len(wire) - 2 or wire[offset] not in _UNESCAPE:
+            if offset >= len(wire) - 2 or wire[offset] not in _UNESCAPE_MAP:
                 return {**result, "framing_error": "unknown_escape", "crc_valid": None}
-            byte = _UNESCAPE[wire[offset]]
+            byte = _UNESCAPE_MAP[wire[offset]]
         decoded.append(byte)
         offset += 1
     result["decoded_hex"] = decoded.hex()
+    result["giant"] = len(decoded) > MAX_FRAME_SIZE  # The live parser discards these.
     if len(decoded) < 6:
         return {**result, "framing_error": "runt", "crc_valid": None}
     body = bytes(decoded[:-2])
@@ -119,8 +118,78 @@ def decode_wire_frame(wire: bytes) -> dict[str, Any]:
     return result
 
 
+class _LiveFraming:
+    """Mirror the live parser's framing transitions to report which frames it would keep."""
+
+    HUNT, START, FRAME, ESCAPE, GIANT, GIANT_ESCAPE = range(6)
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._state = self.HUNT
+        self._length = 0
+        self._start = 0
+        self.completed: dict[int, int] = {}  # End offset -> start offset, decoded by the parser.
+
+    def _begin(self, position: int) -> None:
+        self._state, self._length, self._start = self.FRAME, 0, position - 1
+
+    def feed(self, offset: int, data: bytes) -> None:
+        for position, byte in enumerate(data, offset):
+            state = self._state
+            if state == self.HUNT:  # Parser IDLE and NOISE share these transitions.
+                self._state = self.START if byte == 0x7E else self.HUNT
+            elif state == self.START:
+                if byte == 0x07:
+                    self._begin(position)
+                else:
+                    self._state = self.HUNT
+            elif state == self.FRAME:
+                if byte == 0x7E:
+                    self._state = self.ESCAPE
+                elif self._length < MAX_FRAME_SIZE:
+                    self._length += 1
+                else:
+                    self._state = self.GIANT
+            elif state == self.ESCAPE:
+                if byte == 0x08:
+                    self.completed[position + 1] = self._start
+                    self._state = self.HUNT
+                elif byte == 0x07:
+                    self._begin(position)
+                elif byte in _UNESCAPE_MAP:
+                    if self._length < MAX_FRAME_SIZE:
+                        self._length += 1
+                        self._state = self.FRAME
+                    else:
+                        self._state = self.GIANT
+                else:
+                    self._state = self.HUNT
+            elif state == self.GIANT:
+                self._state = self.GIANT_ESCAPE if byte == 0x7E else self.GIANT
+            elif byte == 0x07:
+                self._begin(position)
+            else:
+                self._state = self.HUNT if byte == 0x08 else self.GIANT
+
+    def drop_reason(self, start: int, end: int, frame: dict[str, Any]) -> str | None:
+        if self.completed.get(end) != start:
+            if frame.get("framing_error") == "unknown_escape":
+                return "unknown_escape"
+            return "giant" if frame.get("giant") else "framing_state"
+        if frame.get("framing_error"):
+            return frame["framing_error"]
+        return None if frame.get("crc_valid") else "crc_mismatch"
+
+
 class FrameScanner:
-    """Keep framing across reads/segments, never across connections or gaps."""
+    """Keep framing across reads/segments, never across connections or gaps.
+
+    Frames larger than the live parser accepts are still shown (``giant``), and
+    ``live_parser_would_drop`` reports whether ``Parser.feed`` would discard a
+    frame (stray 0x7E before a start marker, invalid escape, giant, runt, CRC).
+    """
 
     def __init__(self, max_frame_bytes: int = 65536) -> None:
         if max_frame_bytes < 6:
@@ -131,6 +200,7 @@ class FrameScanner:
         self._connection: int | None = None
         self._clock: dict[str, int] = {}
         self._limit = max_frame_bytes
+        self._live = _LiveFraming()
 
     def _record(self, kind: str, length: int, **details: Any) -> dict[str, Any]:
         wire = bytes(self._buffer[:length])
@@ -145,8 +215,14 @@ class FrameScanner:
         }
         if kind == "frame":
             result.update(decode_wire_frame(wire))
+            reason = self._live.drop_reason(self._offset, self._offset + length, result)
+            result.update(live_parser_would_drop=reason is not None, live_parser_drop_reason=reason)
         del self._buffer[:length]
         self._offset += length
+        if self._live.completed:
+            self._live.completed = {
+                end: start for end, start in self._live.completed.items() if end > self._offset
+            }
         return result
 
     def feed(self, chunk: CapturedChunk) -> Iterator[dict[str, Any]]:
@@ -155,12 +231,14 @@ class FrameScanner:
         ):
             if self._buffer:
                 yield self._record("incomplete", len(self._buffer), reason="connection_or_capture_gap")
+            self._live.reset()  # Replay starts a fresh parser here too.
         if not self._buffer:
             self._offset = chunk.stream_offset
         self._connection = chunk.connection_id
         self._clock = {"utc_ns": chunk.utc_ns, "monotonic_ns": chunk.monotonic_ns}
         self._next_offset = chunk.stream_offset + len(chunk.data)
         self._buffer.extend(chunk.data)
+        self._live.feed(chunk.stream_offset, chunk.data)
         while self._buffer:
             start = self._buffer.find(b"\x7e\x07")
             if start < 0:

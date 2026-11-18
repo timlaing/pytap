@@ -78,3 +78,32 @@ export_capture:
       description: Optional stopped session ID; omit for the current session.
       selector:
         text:
+    max_storage_mib:
+      name: Storage budget (MiB)
+      description: >-
+        The archive counts toward this budget, together with existing captures/exports for this instance.
+        Defaults to the current session's budget (or 1024).
+      selector:
+        number:
+          min: 16
+          max: 4096
+          mode: box
+delete_capture:
+  name: Delete packet capture
+  description: >-
+    Permanently delete one stopped capture session and its exported archives. The active session
+    cannot be deleted. Captures are stored in the Home Assistant configuration directory and are
+    therefore included in Home Assistant backups; delete them (and older backups) to remove them fully.
+  fields:
+    config_entry_id:
+      name: PyTap instance
+      required: true
+      selector:
+        config_entry:
+          integration: pytap
+    capture_id:
+      name: Capture ID
+      description: Stopped session ID from the list captures action.
+      required: true
+      selector:
+        text:

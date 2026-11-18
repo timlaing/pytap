@@ -349,7 +349,9 @@ def test_offline_cli_exports_without_touching_source(tmp_path):
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads((output / "summary.json").read_text())["records"]["frame"] == 2
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["records"]["frame"] == 2
+    assert summary["frames_live_parser_would_drop"] == {"crc_mismatch": 1}
     assert (writer.directory / "manifest.json").read_bytes() == original
     result = subprocess.run(
         [sys.executable, str(script), str(writer.directory), "--output", str(output)], capture_output=True

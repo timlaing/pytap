@@ -14,14 +14,13 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
     BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_MODULE_BARCODE, DOMAIN
-from .coordinator import PyTapDataUpdateCoordinator
+from .const import CONF_MODULE_BARCODE, DOMAIN, STALE_ACTION_HOLD
+from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator
 from .entity import module_device_info
 
 
@@ -30,7 +29,7 @@ class PyTapBinarySensorEntityDescription(BinarySensorEntityDescription):
     """Describes a PyTap binary sensor entity."""
 
     value_key: str
-    # Live flags are unavailable once a panel stops reporting.
+    # Live flags follow the stale-reading action once a panel stops reporting.
     live: bool = True
 
 
@@ -61,11 +60,11 @@ BINARY_SENSOR_DESCRIPTIONS: tuple[PyTapBinarySensorEntityDescription, ...] = (
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: PyTapConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up PyTap binary sensors for configured and discovered optimizers."""
-    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     known_barcodes: set[str] = set()
 
     @callback
@@ -90,7 +89,11 @@ async def async_setup_entry(
 
 
 class PyTapBinarySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], BinarySensorEntity):
-    """A per-optimizer status flag or fault indicator."""
+    """A per-optimizer status flag or fault indicator.
+
+    State is only written when it changes, so the recorder doesn't store a
+    row for every power report.
+    """
 
     _attr_has_entity_name = True
     entity_description: PyTapBinarySensorEntityDescription
@@ -106,18 +109,28 @@ class PyTapBinarySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], BinarySen
         self._barcode = module_config[CONF_MODULE_BARCODE]
         self._attr_unique_id = f"{DOMAIN}_{self._barcode}_{description.key}"
         self._attr_device_info = module_device_info(module_config)
+        self._last_written: tuple[Any, ...] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self.entity_description.live:
+            self.async_on_remove(
+                self.coordinator.async_add_freshness_listener(
+                    [self._barcode], self._handle_coordinator_update
+                )
+            )
 
     def _node(self) -> dict[str, Any] | None:
         return (self.coordinator.data or {}).get("nodes", {}).get(self._barcode)
 
     @property
     def available(self) -> bool:
-        node = self._node()
-        if node is None:
+        if self._node() is None:
             return False
-        if self.entity_description.live:
-            return bool(self.coordinator.is_reporting(self._barcode))
-        return True
+        if not self.entity_description.live or self.coordinator.is_reporting(self._barcode):
+            return True
+        # Flags have no meaningful "zero"; only holding keeps them visible.
+        return self.coordinator.stale_action == STALE_ACTION_HOLD
 
     @property
     def is_on(self) -> bool | None:
@@ -133,3 +146,11 @@ class PyTapBinarySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], BinarySen
             "fault_reasons": list(node.get("fault_reasons") or []),
             "last_fault_at": node.get("last_fault_at"),
         }
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        written = (self.available, self.is_on, self.extra_state_attributes)
+        if written == self._last_written:
+            return
+        self._last_written = written
+        self.async_write_ha_state()

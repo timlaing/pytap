@@ -80,8 +80,7 @@ async def test_config_entry_diagnostics_redacts_host(hass: HomeAssistant) -> Non
         )
     }
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -101,8 +100,7 @@ async def test_config_entry_diagnostics_includes_unredacted_barcodes(
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._barcode_to_node = {"A-1234567B": 10}
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -114,8 +112,7 @@ async def test_config_entry_diagnostics_fresh_install(hass: HomeAssistant) -> No
     entry = _make_entry()
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -148,8 +145,7 @@ async def test_config_entry_diagnostics_all_keys_present(
         )
     }
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -188,7 +184,7 @@ async def test_serial_diagnostics_redact_complete_endpoint(hass: HomeAssistant) 
     entry.as_dict.return_value["data"] = entry.data
     entry.as_dict.return_value["title"] = f"PyTap ({endpoint})"
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
     result = await async_get_config_entry_diagnostics(hass, entry)
     assert result["config_entry"]["data"][CONF_SERIAL_PORT] == "**REDACTED**"
     assert result["config_entry"]["title"] == "**REDACTED**"

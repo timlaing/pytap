@@ -19,9 +19,10 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 
 - **Real-time streaming** — Push-based data delivery with sub-second latency (no polling).
 - **Configurable reporting** — Choose **live reporting** (default; every reading delivered as it arrives) or a **time-weighted averaged interval** that caches readings and pushes a single representative value every few seconds to reduce CPU and recorder load on large installations.
-- **Per-optimizer sensors** — 12 sensor entities per Tigo TS4 module: performance,
+- **Per-optimizer entities** — 13 sensors per Tigo TS4 module (performance,
   power, voltage in/out, current in/out, temperature, DC-DC duty cycle, RSSI,
-  daily energy, total energy, and readings today.
+  daily energy, total energy, readings today, status code) plus 3 diagnostic
+  binary sensors (high output mode, low voltage flag, reading fault).
 - **Aggregate sensors** — 4 sensors per string and 4 for the full installation: performance, power, daily energy, total energy.
 - **Performance tracking** — Per-optimizer, per-string, and installation-wide performance percentage based on configurable peak panel power (Wp).
 - **Diagnostics download** — Integration diagnostics export includes parser counters, infrastructure/mapping state, and per-node summaries.
@@ -31,10 +32,12 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 - **Persistent barcode mapping** — Discovered barcodes and node mappings are
   saved across restarts. When you add a previously-discovered barcode,
   it resolves instantly without waiting for the next gateway enumeration.
-- **Restart-safe availability** — Last known node readings are persisted and
-  restored on startup, so sensors stay available with the most recent value
-  even before the first live frame arrives (for example after a night restart).
-- **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time.
+- **Stale-reading handling** — Choose what live readings do when a panel stops
+  reporting (for example at night): become unavailable (default), show zero, or
+  hold the last value. See [Stale readings](#stale-readings).
+- **Reading fault detection** — Physically impossible reports are discarded and
+  flagged instead of being shown or added to energy.
+- **Energy accumulation** — Trapezoidal Wh integration with proactive midnight reset and monotonic lifetime totals. Daily sensors zero at exactly midnight local time. Energy totals are restored after a restart.
 - **Embedded parser** — The protocol parser is bundled; Home Assistant installs `serialx` for serial access automatically.
 - **Native serial selection** — Choose local adapters and ESPHome proxy ports using Home Assistant's serial-port picker.
 - **Passive module discovery** — New setups can finish with no modules. Optimizer sensors and aggregate membership are created as barcode-bearing bus data arrives, and discovered modules survive restarts.
@@ -42,7 +45,7 @@ Use a suitably rated RS-485 transceiver; never connect ESP GPIO pins directly to
 
 ## Sensors
 
-Each configured Tigo TS4 optimizer exposes the following sensors:
+Each tracked Tigo TS4 optimizer (configured or discovered) exposes the following sensors:
 
 | Sensor           | Unit | Device Class      |
 | ---------------- | ---- | ----------------- |
@@ -57,12 +60,50 @@ Each configured Tigo TS4 optimizer exposes the following sensors:
 | RSSI             | dBm  | `signal_strength` |
 | Daily Energy     | Wh   | `energy`          |
 | Total Energy     | Wh   | `energy`          |
-| Readings Today   | —    | —                 |
+| Readings Today   | —    | — (diagnostic)    |
+| Status Code      | —    | — (diagnostic)    |
+
+and these diagnostic binary sensors:
+
+| Binary sensor    | Device Class |
+| ---------------- | ------------ |
+| High Output Mode | —            |
+| Low Voltage Flag | —            |
+| Reading Fault    | `problem`    |
+
+**Status entities.** Status code, Low voltage flag and High output mode come
+from power-report bytes that Tigo has not documented. Their names describe
+patterns seen in captured data, not confirmed meanings:
+
+- **Status code** — the raw byte shown as hex. `0x64` is normal; `0x68` is
+  typical at low current around dawn/dusk; `0xE4` at low input voltage.
+- **Low voltage flag** — the top bit of that status byte.
+- **High output mode** — a separate bit, set almost only above about 0.5 A
+  input current.
+
+These three only record a new state when their value changes, so they don't
+add a database row for every report.
+
+**Reading fault** turns on when a report is physically impossible: output
+voltage more than 2 V above input, either voltage outside 0–100 V, or
+temperature outside −40…125 °C. Such readings are discarded: they don't
+replace the last good values, add energy, or count as a fresh report. The
+fault clears on the next valid report. It is unknown until the optimizer's
+first report, keeps its state across restarts, and has `fault_reasons` and
+`last_fault_at` attributes.
 
 PyTap also creates aggregate virtual devices:
 
 - **Tigo String <name>** — `performance`, `power`, `daily_energy`, `total_energy`
 - **Tigo Installation** — `performance`, `power`, `daily_energy`, `total_energy`
+
+When automatic discovery is enabled, the installation device also has a
+diagnostic **Module discovery** sensor (see [Step 2](#step-2-add-modules)).
+
+String and installation energy totals add up each member panel's increase
+since it was last seen, so moving a panel to another string or discovering a
+new panel doesn't add that panel's lifetime energy to the group. The daily
+aggregate resets at local midnight.
 
 ---
 
@@ -110,8 +151,9 @@ PyTap is configured entirely through the Home Assistant UI — no YAML needed.
 For a proxy, first add its ESPHome device to HA and configure `serial_proxy` in its firmware. Each port on a multi-port device is listed separately. The picker also permits a manual local device path or an `esphome-hass://` URL for an offline port; prefer selecting the discovered port so its full identity is retained. Direct `esphome://`, `socket://`, and credential-bearing URLs are not accepted by the serial form; raw TCP converters use the TCP form.
 
 > **Note:** The connection test runs off the event loop and is bounded. If the gateway is temporarily
-> unreachable (e.g., powered off at night), setup will proceed and connect
-> when the gateway becomes available.
+> unreachable (e.g., powered off at night), the form shows **Could not connect**. Submit the same
+> settings again to save them anyway; PyTap keeps retrying in the background and connects
+> when the gateway becomes available. Local serial paths must be under `/dev/`.
 
 ### ESPHome serial-proxy example
 
@@ -142,9 +184,9 @@ serial_proxy:
 
 This uses the current [ESPHome serial proxy component](https://esphome.io/components/serial_proxy/), which is experimental. Configure the ESPHome device's board/network normally, flash it, and add it to Home Assistant. Select **Tigo Bus** in PyTap; API credentials remain managed by HA. Match the selected baud rate to the bus.
 
-Serial ports are exclusive: another PyTap entry cannot use the same endpoint, and another application/integration may also hold it busy. An absent proxy is retried, never replaced automatically with a different port. If you remove and recreate the ESPHome config entry, reselect its port in PyTap. No serial data at night does not make the saved settings invalid.
+Serial ports are exclusive: another PyTap entry cannot use the same endpoint (a symlink such as `/dev/serial/by-id/…` counts as the same port as its target), and another application/integration may also hold it busy. An absent proxy is retried, never replaced automatically with a different port. If you remove and recreate the ESPHome config entry, reselect its port in PyTap. No serial data at night does not make the saved settings invalid.
 
-Version 1.3 requires **HA 2026.11+**. Existing TCP entries migrate automatically without changing their entities or energy history.
+PyTap requires **HA 2026.11+**. Existing TCP entries migrate automatically without changing their entities or energy history.
 
 ### Step 2: Add Modules
 
@@ -154,7 +196,7 @@ After entering connection details, you'll see a modules menu:
 
 Discovered modules use the name **Optimizer <barcode>**, the **Discovered** string group, and an unknown rated power (**0 Wp**). No physical string layout or panel rating is inferred from bus traffic. Power and energy readings work immediately; optimizer/group performance percentages are not calculated while the relevant panel rating is unknown. Edit the module later to enter its actual name, string, and rated Wp.
 
-Discovery is gradual and depends on gateway traffic; a quiet/offline bus or missing node table may delay it. Repeated reports do not create duplicate sensors. Discovered metadata is stored with coordinator state, so admitting modules does not repeatedly reload the connection.
+Discovery is gradual and depends on gateway traffic; a quiet/offline bus or missing node table may delay it. Repeated reports do not create duplicate sensors, and a barcode already tracked by another PyTap entry is not adopted. Discovered metadata is stored with coordinator state, so admitting modules does not repeatedly reload the connection.
 
 For manual selection, open **Module discovery settings**, disable automatic discovery, then:
 
@@ -167,16 +209,17 @@ For manual selection, open **Module discovery settings**, disable automatic disc
 3. Repeat for each optimizer you want to monitor.
 4. Click **"Finish setup"** when done.
 
-Manual setup requires at least one module; finishing without one shows an explicit error and the add-module form. Existing installations retain manual mode after the version 7 migration, unless you enable automatic discovery in options.
+Manual setup requires at least one module; finishing without one shows an explicit error and the add-module form. Installations upgraded from earlier versions keep manual mode, unless you enable automatic discovery in options.
 
 ### Finding Barcodes
 
 Barcodes are printed on each Tigo TS4 optimizer module. If you can't physically access them, PyTap will log any **unconfigured** barcodes it discovers on the bus:
 
 ```
-INFO: Discovered unconfigured Tigo optimizer barcode: A-9999999Z
-      (gateway=1, node=55). Add it to your PyTap module list to start tracking.
+INFO: Discovered unconfigured Tigo optimizer barcode: A-9999999Z (gateway=1, node=55).
 ```
+
+With automatic discovery enabled, PyTap then starts tracking it (`Automatically tracking Tigo optimizer A-9999999Z`); in manual mode, add it as a module.
 
 Check your Home Assistant logs after the gateway has been running for a while (up to 24 hours for full discovery).
 
@@ -186,6 +229,7 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 
 - **Change connection** — Switch between TCP and serial/proxy, or update the endpoint/baud rate. Connection changes save immediately and reload PyTap without changing module settings, entity IDs, or stored energy. The current serial port is not probed again while the listener owns it.
 - **Change reporting settings** — Toggle live reporting or set the averaged reporting interval (see [Reporting modes](#reporting-modes)).
+- **Change stale reading behaviour** — Choose what live readings do when a panel stops reporting, and after how long (see [Stale readings](#stale-readings)).
 - **Change module discovery** — Enable/disable discovering new optimizers. Disabling discovery keeps modules already known. Enabling it also admits barcodes logged in earlier manual sessions.
 - **Edit a module** — Change its friendly name, string group, and rated panel power without changing barcode-based entity IDs or stored energy. Enter **0 Wp** if the rating is unknown.
 - **Add** new optimizer modules, or explicitly restore an ignored barcode.
@@ -193,6 +237,8 @@ Go to **Settings → Devices & Services → PyTap → Configure** to:
 - **Save and close** to apply changes.
 
 Module/discovery edits are saved together on **Save and close**. Modules discovered while the options flow is open are merged into the saved catalogue, without overwriting your edits or undoing explicit removals.
+
+You can also delete an optimizer device, or a string device that no longer contains any optimizers, from its device page in Home Assistant. Deleting an optimizer works like **Remove**: its barcode is ignored by automatic discovery. The installation device can't be deleted. Devices of removed modules and empty strings are also cleaned up automatically when PyTap starts.
 
 ### Reporting modes
 
@@ -205,6 +251,20 @@ PyTap can deliver readings to Home Assistant in two ways, selectable under **Con
 
 Energy totals (daily and lifetime) are always integrated from the raw readings, so the reporting mode only affects the instantaneous values (power, voltage, current, temperature) shown on dashboards — never the accumulated energy figures.
 
+### Stale readings
+
+Optimizers stop reporting at night and during radio dropouts. Under **Configure → Change stale reading behaviour** you choose what each panel's live readings do once no valid report has arrived within the **timeout** (60–600 seconds, default 120):
+
+| Action                    | Panel readings                                                                                                                                                                                     | String / installation power and performance                      |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Unavailable** (default) | Power, voltages, currents, temperature, duty cycle, RSSI, performance, status code, high output mode and low voltage flag become unavailable.                                                      | Count only panels that are reporting; unavailable when none are. |
+| **Zero**                  | Power, voltage in/out, current in/out and performance show 0 (performance stays unknown if the panel rating is unknown). Temperature, duty cycle, RSSI and the status entities become unavailable. | Count only reporting panels; show 0 when none are.               |
+| **Hold last value**       | Keep the last values, including after a restart (the previous behaviour). The status entities are unknown after a restart until the next report.                                                   | Include every panel's last values.                               |
+
+Energy sensors (daily energy, total energy, readings today) and the reading-fault sensor are not affected by any action. In averaged reporting mode the reporting interval is added to the timeout, so panels don't flicker between updates. PyTap checks for stale panels every 5 seconds.
+
+After a restart, saved readings aren't treated as current: with **Unavailable** they stay unavailable, and with **Zero** they show 0, until each panel's first new report arrives. Energy totals are restored either way.
+
 ### Diagnostics Download
 
 PyTap diagnostics are available from the integration page:
@@ -214,7 +274,7 @@ PyTap diagnostics are available from the integration page:
 3. Use the menu (⋮) and select **Download diagnostics**.
 
 The diagnostics JSON includes parser counters, infrastructure and node mappings,
-discovered barcodes, connection state, and per-node summaries. Host/IP and complete serial endpoints are redacted; transport type, baud rate, and retry state remain visible.
+discovered barcodes, connection state, packet-capture status, and per-node summaries (including whether each panel is currently reporting, its status code and any reading fault). Host/IP, complete serial endpoints and capture file paths are not included; transport type, baud rate, and retry state remain visible.
 
 ---
 
@@ -230,17 +290,17 @@ PyTap Coordinator
     ├── Embedded protocol parser (pytap library)
     │   └── Parses frames → PowerReport, Infrastructure, Topology events
     │
-    ├── Barcode allowlist filter
-    │   ├── Configured → update sensor entities
-    │   └── Unconfigured → log for discovery
+    ├── Optimizer filter
+    │   ├── Configured or discovered → update entities
+    │   └── Unconfigured (discovery off, or removed) → log only
     │
-    └── Push to Home Assistant event loop
-        └── Sensor entities update in real time
+    └── Push copies to Home Assistant event loop
+        └── Sensor and binary sensor entities update in real time
 ```
 
-PyTap uses a background listener thread that streams data, parses protocol frames, and dispatches events to the Home Assistant event loop. Serial connections use `serialx`'s async transport on HA's loop, bridged to the same parser thread with bounded reads. Unload waits for the worker to release its port before allowing a replacement listener. Only events matching your configured barcodes create or update sensor entities. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
+PyTap uses a background listener thread that streams data, parses protocol frames, and keeps its own working copy of the readings. Home Assistant only ever receives finished copies, so entities never see half-updated data. Serial connections use `serialx`'s async transport on HA's loop, bridged to the same parser thread with bounded reads. Unload waits (up to a time limit) for the worker to release its port; if it is slow, setup is retried until it has stopped, so a replacement listener never shares the port. Only configured or automatically discovered optimizers get entities. In the default **live reporting** mode each update is forwarded immediately; in **averaged interval** mode updates are buffered and flushed as a time-weighted average every few seconds (see [Reporting modes](#reporting-modes)).
 
-On startup, PyTap restores persisted coordinator state (barcode mappings, energy accumulators, and last node snapshots). Sensor entities also use Home Assistant restore fallback if needed, so a restart during low/no production does not force entities into unavailable when prior data exists.
+On startup, PyTap restores persisted coordinator state (barcode mappings, discovered modules, energy accumulators, last node snapshots and reading-fault state). Energy sensors show their restored totals straight away. Whether live readings show their saved values depends on the [stale-reading action](#stale-readings): only **Hold last value** shows them before new reports arrive. If the connection drops, PyTap logs it once and keeps retrying quietly until it recovers.
 
 ---
 
@@ -251,11 +311,12 @@ On startup, PyTap restores persisted coordinator state (barcode mappings, energy
 Version 1.5 adds admin-only actions under **Tools → Actions**. Capture is **off
 by default**, and never resumes automatically after a restart or integration
 reload. It copies reads from the existing listener before decoding, without
-opening another connection or transmitting any bus commands.
+opening another connection or transmitting any bus commands. A running capture
+is stopped and finalised when Home Assistant shuts down.
 
 1. Call **`pytap.start_capture`**, select the PyTap instance, and choose:
    - `duration_minutes`: maximum duration, default **1440** (24 hours).
-   - `max_storage_mib`: recording storage budget, default **1024** (1 GiB).
+   - `max_storage_mib`: storage budget, default **1024** (1 GiB).
 2. Use **`pytap.capture_status`** to check progress, stop reason, queue/disk
    errors, and dropped bytes/records. Capture status is also in diagnostics.
 3. Call **`pytap.stop_capture`** when finished, or let the limit stop it.
@@ -265,25 +326,36 @@ opening another connection or transmitting any bus commands.
 5. **`pytap.export_capture`** validates and creates a private ZIP, returning its
    local archive path. Retrieve it through Samba/your existing file-management
    app. It is deliberately **not published at a web endpoint**. Stop recording
-   before exporting; ZIP creation needs extra free disk space. Existing ZIPs
-   count against the budget of subsequent recording sessions.
+   before exporting. The ZIP counts toward the storage budget (optional
+   `max_storage_mib`, default the session's budget or 1024); if it doesn't fit,
+   the export is refused.
+6. **`pytap.delete_capture`** permanently deletes one stopped session and its
+   exported ZIPs. The active session can't be deleted.
 
 The writer uses a bounded, non-blocking queue. On backpressure it stops recording
 and reports loss rather than slowing the parser. On storage exhaustion it stops
 instead of deleting earlier evidence. Raw segments rotate at **16 MiB**; the
 budget includes existing recordings/exports for that config entry and reserves
-space for metadata. Archive creation is an explicit additional operation, not
-part of a running recorder's reserved space. No capture files are automatically
-removed. Free budget by deliberately moving/deleting evidence after copying it.
+space for metadata. Captures are never deleted automatically while the PyTap
+entry exists; free budget with `delete_capture` after copying what you need.
+Deleting the PyTap entry deletes all of its captures.
 
-Files live below `/config/pytap_captures/<config_entry_id>/<capture_id>/`:
+Files live in the Home Assistant configuration directory, below
+`/config/pytap_captures/<config_entry_id>/<capture_id>/` (ZIPs are written next
+to the session directory). They are therefore **included in Home Assistant
+backups**; delete captures, and older backups, to remove them fully. Each
+session directory contains:
 
-| File                   | Contents                                                                                                                 |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `bus-000000.bin`, …    | Unchanged bytes: unknown types, bad CRCs, escaped bytes, extra report fields, and noise                                  |
-| `chunks-000000.bin`, … | UTC/monotonic nanoseconds, logical byte offset, length, connection generation (`<QQQII`, little-endian, 32 bytes/record) |
-| `events.jsonl`         | Connection open/close/error markers, without endpoints or exception text                                                 |
-| `manifest.json`        | Source/framing/software versions, initial infrastructure, checksums/counts, completeness/loss/error information          |
+| File                   | Contents                                                                                                                                                          |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bus-000000.bin`, …    | Unchanged bytes: unknown types, bad CRCs, escaped bytes, extra report fields, and noise                                                                           |
+| `chunks-000000.bin`, … | UTC/monotonic nanoseconds, logical byte offset, length, connection generation (`<QQQII`, little-endian, 32 bytes/record)                                          |
+| `events.jsonl`         | Connection open/close/error markers (error type only), without endpoints or exception text                                                                        |
+| `manifest.json`        | Source/framing/software versions, initial infrastructure, SHA-256 checksums/counts for every file (including `events.jsonl`), completeness/loss/error information |
+
+The manifest is rewritten only when something changed (at most every 10 seconds
+while recording, plus at rotation and stop), and only after the data it
+describes has been flushed to disk.
 
 Timestamps describe **when a source read returned**, not exact UART-byte airtime.
 Rotation can split a read into index records with the same timestamp. `complete`
@@ -312,11 +384,15 @@ output directory is never overwritten. The tool streams evidence and produces:
 - `chunks.jsonl`: readable observation times, offsets, lengths and connections.
 - `frames.jsonl`: supported/unknown packets, wire bytes, complete headers and
   payloads, CRC flags, unknown/extra measurement bytes, noise and incomplete
-  frames. Invalid-CRC measurements are inspection-only.
+  frames. Invalid-CRC measurements are inspection-only. Each frame also says
+  whether the live parser would have dropped it (`live_parser_would_drop`,
+  with a `live_parser_drop_reason` such as `crc_mismatch` or `giant`); frames
+  larger than the live parser accepts are flagged `giant`.
 - `events.jsonl`: current decoder events, using recorded UTC observations for
   slot-clock reconstruction rather than replay time. Correlation resets at
   reconnects/gaps; the recorded infrastructure snapshot bootstraps discovery.
-- `summary.json`: completeness/loss and inspection counts.
+- `summary.json`: completeness/loss, inspection counts and counts of frames the
+  live parser would drop.
 
 Incomplete captures require `--allow-incomplete`. Stale checksums/counts and
 partial rows produce warnings and an unverified/incomplete summary, never
@@ -325,13 +401,18 @@ timestamped chunks. A checksum mismatch in a supposedly complete capture is
 always an error, even with that override. Oversized corrupt frames are exported
 as bounded fragments; their full byte stream remains in the raw evidence.
 
-If a crash created rotated segments before updating the manifest, ZIP export
-also preserves those unlisted files and adds `recovery.json`, marking them
-unverified. They are not automatically timestamp-replayed. The initial parser
+An interrupted capture can still be exported, even if its index ends in
+corrupt rows (for example after a power cut); replay stops at the first invalid
+row. If a crash created rotated segments before updating the manifest, ZIP
+export also preserves those unlisted files. ZIPs of incomplete captures include
+`recovery.json`, which lists any validation warnings and unlisted files and
+records whether the archive could be verified. Unlisted files are not automatically timestamp-replayed. The initial parser
 state is snapshotted in the listener immediately before the first admitted
 read, so infrastructure changes during file preparation cannot silently assign
-new measurements to stale barcodes. Invalid slot counters remain inspectable
-as raw frames but are rejected by the measurement decoder.
+new measurements to stale barcodes. Power reports with an invalid slot counter
+remain inspectable as raw frames but are dropped by the measurement decoder; an
+invalid slot counter in a receive-response header only skips that frame's
+slot-clock update. Both are counted in the parser's `invalid_slots` counter.
 
 This repository includes a dev container with Home Assistant pre-installed for local development and testing.
 
@@ -340,15 +421,28 @@ This repository includes a dev container with Home Assistant pre-installed for l
 ```
 pytap/
 ├── custom_components/pytap/     # The HA custom component
-│   ├── __init__.py              # Integration lifecycle
+│   ├── __init__.py              # Integration lifecycle, migrations, device removal
+│   ├── binary_sensor.py         # Binary sensor platform (status flags, reading fault)
+│   ├── capture_services.py      # Packet-capture actions (start/stop/status/list/export/delete)
 │   ├── config_flow.py           # Config & options flows
+│   ├── connection.py            # TCP/serial settings validation and serial source
 │   ├── const.py                 # Constants
 │   ├── coordinator.py           # Push-based data coordinator
-│   ├── sensor.py                # Sensor platform (12 entity types)
+│   ├── diagnostics.py           # Diagnostics download
+│   ├── energy.py                # Energy accumulation helpers
+│   ├── entity.py                # Shared optimizer device info
+│   ├── sensor.py                # Sensor platform (13 per-optimizer types + aggregates)
+│   ├── services.yaml            # Action descriptions
 │   ├── manifest.json            # Integration metadata
 │   ├── strings.json             # UI strings
 │   ├── translations/en.json     # English translations
+│   ├── brand/                   # Bundled Tigo icons and logos
 │   └── pytap/                   # Embedded protocol parser library
+│       └── core/
+│           ├── capture.py       # Raw packet capture writer, validation, export
+│           └── replay.py        # Offline frame inspection and replay
+├── scripts/
+│   └── replay_capture.py        # Offline capture inspection/replay tool
 ├── deploy/                      # Deployment tooling
 │   ├── deploy.sh                # Deploy script (SSH-based)
 │   └── .deploy.env.example      # Example credentials config
@@ -357,7 +451,8 @@ pytap/
 │   ├── architecture.md          # Architecture & design document
 │   └── implementation.md        # Implementation details & history
 ├── config/                      # Dev HA config directory
-├── requirements.txt             # HA + dev dependencies
+├── requirements.txt             # Home Assistant Core dependencies
+├── requirements-test.txt        # Test dependencies (custom-component test harness)
 └── pytest.ini                   # Test configuration
 ```
 
@@ -370,10 +465,10 @@ python3 -m homeassistant --config config/ --debug
 ### Running Tests
 
 ```bash
-# Python 3.14.2+; install the published custom-component test harness.
+# Python 3.14 (as in CI); install the published custom-component test harness.
 pip install -r requirements-test.txt
 
-# Integration tests (config flow + sensor platform)
+# Integration tests
 python3 -m pytest tests/ -vv --tb=short
 
 # Parser library tests
@@ -385,7 +480,7 @@ The current published harness pins HA 2026.10.4; its private fixtures are not co
 ### Linting
 
 ```bash
-python3 -m ruff check custom_components/pytap/
+python3 -m ruff check custom_components/pytap/ tests/ scripts/
 ```
 
 ### Deploying to a Home Assistant Instance

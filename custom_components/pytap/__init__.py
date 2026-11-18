@@ -8,16 +8,19 @@ and wires up platform forwarding and teardown.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
-from .capture_services import register_capture_services
+from .capture_services import async_remove_captures, register_capture_services
+from .connection import InvalidConnectionSettings
 from .const import (
     CONF_AUTO_DISCOVERY,
     CONF_CONNECTION_TYPE,
@@ -37,7 +40,7 @@ from .const import (
     MAX_WRITE_INTERVAL,
     MIN_WRITE_INTERVAL,
 )
-from .coordinator import PyTapDataUpdateCoordinator
+from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator, coordinator_store
 
 _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -67,36 +70,51 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: PyTapConfigEntry) -> bool:
     """Set up PyTap from a config entry.
 
-    1. Clean up legacy entity unique IDs from pre-v0.2.0.
-    2. Create the streaming coordinator.
-    3. Run an initial refresh to validate connectivity.
-    4. Start the background listener task.
+    1. Wait for any previous listener for this entry to release its port.
+    2. Clean up legacy entity unique IDs from pre-v0.2.0.
+    3. Create the coordinator and start the background listener (no
+       connectivity check: an offline gateway is retried in the background).
+    4. Remove devices for modules that are no longer configured.
     5. Store the coordinator and forward platform setup.
     """
-    hass.data.setdefault(DOMAIN, {})
     # A timed-out stop must not allow a new coordinator to claim the same port.
-    if previous := hass.data[DOMAIN].get(entry.entry_id):
+    # Raising NotReady makes Home Assistant retry setup until it has stopped.
+    stopping = _stopping_coordinators(hass)
+    if previous := stopping.get(entry.entry_id):
         if not await previous.async_stop_listener():
-            raise ConfigEntryNotReady("Previous PyTap listener is still stopping")
+            raise ConfigEntryNotReady(translation_domain=DOMAIN, translation_key="previous_listener_stopping")
+        stopping.pop(entry.entry_id, None)
 
     # --- Legacy entity migration (voltage/current → voltage_in/out, current_in/out) ---
     await _async_cleanup_legacy_entities(hass, entry)
 
-    coordinator = PyTapDataUpdateCoordinator(hass, entry)
+    try:
+        coordinator = PyTapDataUpdateCoordinator(hass, entry)
+    except InvalidConnectionSettings as err:
+        # Older versions could save e.g. an out-of-range port. Ask the user
+        # to fix it in the options flow rather than retrying forever.
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_connection_settings",
+            translation_placeholders={"field": err.field},
+        ) from err
 
-    # Validates that the coordinator can be initialised; does not block on data
     await coordinator.async_config_entry_first_refresh()
-
-    # Start the background streaming listener
     await coordinator.async_start_listener()
+    entry.runtime_data = coordinator
 
-    # Ensure listener is stopped on entry unload (covers HA shutdown path)
-    entry.async_on_unload(coordinator.async_stop_listener)
+    # Home Assistant doesn't unload entries on shutdown: stop the listener and
+    # finalise any packet capture explicitly so its files stay verifiable.
+    async def _async_on_stop(_event: Event) -> None:
+        await coordinator.async_stop_listener()
 
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_on_stop))
+
+    if coordinator.store_loaded:
+        _async_remove_orphaned_devices(hass, entry, coordinator.modules)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -111,22 +129,75 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: PyTapConfigEntry) -> bool:
     """Unload a config entry.
 
-    1. Unload platforms.
-    2. Stop the coordinator's background listener.
-    3. Remove coordinator from hass.data.
+    A listener that doesn't stop in time parks its coordinator in the stopping
+    registry so the next setup waits (``ConfigEntryNotReady``) instead of
+    the entry getting stuck as failed-unload until Home Assistant restarts.
     """
-    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    if not await coordinator.async_stop_listener():
-        return False
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
-    else:
-        await coordinator.async_start_listener()
-
+    coordinator = entry.runtime_data
+    stopped = await coordinator.async_stop_listener()
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not stopped:
+        _stopping_coordinators(hass)[entry.entry_id] = coordinator
+        _LOGGER.warning("PyTap listener is still stopping; setup will wait for it")
     return unload_ok
+
+
+def _stopping_coordinators(hass: HomeAssistant) -> dict[str, PyTapDataUpdateCoordinator]:
+    """Coordinators whose listener timed out on unload, by entry ID (never live ones)."""
+    return hass.data.setdefault(DOMAIN, {})
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete this entry's private packet captures and saved state with the entry."""
+    await async_remove_captures(hass, entry.entry_id)
+    await coordinator_store(hass, entry.entry_id).async_remove()
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: PyTapConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Let users delete optimizer and empty string devices from the UI.
+
+    Deleting an optimizer excludes its barcode (so discovery doesn't re-add it)
+    and reloads the entry. The installation device and strings that still
+    contain modules can't be deleted.
+    """
+    identifiers = {value for domain, value in device.identifiers if domain == DOMAIN}
+    modules = list(entry.data.get(CONF_MODULES, []))
+    known = entry.runtime_data.modules if entry.state is ConfigEntryState.LOADED else modules
+    barcodes = {module.get(CONF_MODULE_BARCODE) for module in known}
+    if removed := identifiers & barcodes:
+        excluded = set(entry.data.get(CONF_EXCLUDED_BARCODES, [])) | removed
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_MODULES: [m for m in modules if m.get(CONF_MODULE_BARCODE) not in removed],
+                CONF_EXCLUDED_BARCODES: sorted(excluded),
+            },
+        )
+        return True
+    used_strings = {f"{entry.entry_id}_string_{m.get(CONF_MODULE_STRING)}" for m in known}
+    return not identifiers & ({f"{entry.entry_id}_installation"} | used_strings)
+
+
+def _async_remove_orphaned_devices(
+    hass: HomeAssistant, entry: ConfigEntry, modules: list[dict[str, Any]]
+) -> None:
+    """Remove devices (and their entities) for removed modules or empty strings."""
+    keep = {f"{entry.entry_id}_installation"}
+    for module in modules:
+        keep.add(module.get(CONF_MODULE_BARCODE, ""))
+        keep.add(f"{entry.entry_id}_string_{module.get(CONF_MODULE_STRING, '')}")
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        identifiers = {value for domain, value in device.identifiers if domain == DOMAIN}
+        if identifiers and not identifiers & keep:
+            _LOGGER.info("Removing PyTap device %s: no longer configured", device.name)
+            registry.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -96,6 +96,10 @@ async def test_complete_offline_serial_setup(hass, endpoint):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {CONF_SERIAL_PORT: endpoint}
         )
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_SERIAL_PORT: endpoint}
+        )
     assert result["step_id"] == "modules_menu"
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"next_step_id": "add_module"})
     result = await hass.config_entries.flow.async_configure(result["flow_id"], MODULES[0])
@@ -152,9 +156,10 @@ async def test_options_switch_transport_preserves_identity_and_data(hass):
     entry_id, unique_id = entry.entry_id, entry.unique_id
     result = await _connection_options(hass, entry)
     with patch("custom_components.pytap.config_flow.validate_connection", side_effect=OSError("offline")):
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"], {CONF_SERIAL_PORT: PROXY_URL}
-        )
+        for _ in range(2):  # Unreachable: the second identical submit saves.
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], {CONF_SERIAL_PORT: PROXY_URL}
+            )
     assert result["step_id"] == "init"
     assert entry.data[CONF_SERIAL_PORT] == PROXY_URL
     assert "host" not in entry.data and "port" not in entry.data

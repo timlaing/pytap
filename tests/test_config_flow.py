@@ -65,7 +65,7 @@ async def test_user_step_proceeds_to_menu(hass: HomeAssistant) -> None:
 async def test_user_step_proceeds_even_without_connection(
     hass: HomeAssistant,
 ) -> None:
-    """Test that a failed connection test still proceeds to modules menu."""
+    """An unreachable gateway is reported once; submitting again proceeds."""
     result = await _init_tcp_flow(hass)
 
     with patch(
@@ -76,8 +76,13 @@ async def test_user_step_proceeds_even_without_connection(
             result["flow_id"],
             {"host": MOCK_HOST, "port": MOCK_PORT},
         )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"host": MOCK_HOST, "port": MOCK_PORT},
+        )
 
-    # Should still proceed to modules menu (connection test is non-blocking)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "modules_menu"
 
@@ -432,8 +437,14 @@ async def test_options_change_connection_warn_only_on_failure(
             result["flow_id"],
             {"host": new_host, "port": MOCK_PORT},
         )
+        assert result["errors"] == {"base": "cannot_connect"}
+        assert entry.data["host"] != new_host
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {"host": new_host, "port": MOCK_PORT},
+        )
 
-    # Should still return to menu despite connection failure
+    # Submitting the same values again saves them despite the failure
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "init"
 

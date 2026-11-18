@@ -224,6 +224,6 @@ async def test_both_transports_feed_identical_parser_pipeline(hass, serial):
         await coordinator._async_listen()
         assert await coordinator.async_stop_listener()
     assert [call.args[0] for call in parser.feed.call_args_list] == [b"first-fragment", b"second-fragment"]
-    assert coordinator.data["nodes"]["A-1234567B"]["power"] == 120
-    assert coordinator.data["nodes"]["A-1234567B"]["readings_today"] == 1
+    assert coordinator._state["nodes"]["A-1234567B"]["power"] == 120
+    assert coordinator._state["nodes"]["A-1234567B"]["readings_today"] == 1
     source.close.assert_called_once()

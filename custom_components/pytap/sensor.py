@@ -7,7 +7,7 @@ Entities keep stable barcode-based identifiers across discovery and restarts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, tzinfo
 import logging
 from typing import Any
 
@@ -30,24 +30,33 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_MODULE_BARCODE,
-    CONF_MODULE_NAME,
     CONF_MODULE_PEAK_POWER,
     CONF_MODULE_STRING,
     DEFAULT_PEAK_POWER,
     DOMAIN,
+    STALE_ACTION_HOLD,
+    STALE_ACTION_ZERO,
 )
-from .coordinator import PyTapDataUpdateCoordinator
+from .coordinator import PyTapConfigEntry, PyTapDataUpdateCoordinator
 from .entity import module_device_info
 
 _LOGGER = logging.getLogger(__name__)
+
+# Electrical readings that report 0 when the stale action is "zero". Others
+# (temperature, duty cycle, RSSI, status) have no meaningful zero and go
+# unavailable instead.
+ZERO_WHEN_STALE = frozenset(
+    {"power", "voltage_in", "voltage_out", "current_in", "current_out", "performance"}
+)
 
 
 def _coerce_restored_state_value(raw_state: str, sensor_key: str) -> int | float | None:
@@ -71,9 +80,11 @@ class PyTapSensorEntityDescription(SensorEntityDescription):
     """Describes a PyTap sensor entity."""
 
     value_key: str
-    # Live readings are unavailable once a panel stops reporting; energy
-    # totals stay available so history is preserved overnight.
+    # Live readings follow the stale-reading action once a panel stops
+    # reporting; energy totals stay available so history is preserved.
     live: bool = True
+    # Skip state writes when nothing changed (avoids a recorder row per report).
+    write_on_change: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -190,6 +201,7 @@ SENSOR_DESCRIPTIONS: tuple[PyTapSensorEntityDescription, ...] = (
         translation_key="status_code",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_key="status_code",
+        write_on_change=True,
     ),
 )
 
@@ -276,15 +288,15 @@ INSTALLATION_SENSOR_DESCRIPTIONS: tuple[PyTapAggregateSensorDescription, ...] = 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: PyTapConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up PyTap sensors from a config entry.
 
     Creates sensor entities deterministically from the configured module list.
     Each configured module gets the full set of 13 sensor entities.
     """
-    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
     known_barcodes: set[str] = set()
     string_sensors: dict[str, list[PyTapAggregateSensor]] = {}
     installation_sensors: list[PyTapAggregateSensor] = []
@@ -314,7 +326,7 @@ async def async_setup_entry(
                 continue
             known_barcodes.add(barcode)
             for description in SENSOR_DESCRIPTIONS:
-                entities.append(PyTapSensor(coordinator, description, module_config, entry))
+                entities.append(PyTapSensor(coordinator, description, module_config))
 
         for string_name, barcodes in string_to_barcodes.items():
             if string_name not in string_sensors:
@@ -403,14 +415,12 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         coordinator: PyTapDataUpdateCoordinator,
         description: PyTapSensorEntityDescription,
         module_config: dict[str, Any],
-        entry: ConfigEntry,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = description
 
         self._barcode = module_config[CONF_MODULE_BARCODE]
-        self._module_name = module_config[CONF_MODULE_NAME]
         self._module_string = module_config.get(CONF_MODULE_STRING, "")
         self._module_peak_power = coordinator.module_peak_power(self._barcode)
 
@@ -418,10 +428,18 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         self._attr_unique_id = f"{DOMAIN}_{self._barcode}_{description.key}"
         self._attr_device_info = module_device_info(module_config)
         self._restored_native_value = False
+        self._last_written: tuple[Any, ...] | None = None
 
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        if self.entity_description.live:
+            # Energy totals don't depend on whether the panel is reporting.
+            self.async_on_remove(
+                self.coordinator.async_add_freshness_listener(
+                    [self._barcode], self._handle_coordinator_update
+                )
+            )
         if self.entity_description.key == "performance" and self._module_peak_power <= 0:
             # A percentage from an old rating must not masquerade as a current
             # value after the user clears the rating, even without a snapshot.
@@ -454,32 +472,57 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
             self._attr_native_value = native_value
             self._restored_native_value = True
 
+    def _stale(self) -> bool:
+        """A live reading whose panel has stopped sending valid reports."""
+        return self.entity_description.live and not self.coordinator.is_reporting(self._barcode)
+
     @property
     def available(self) -> bool:
-        """Live readings need a recent report; energy totals need any data."""
+        """Live readings follow the stale-reading action; energy totals need any data."""
         if not self.coordinator.data:
             return False
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
-        if self.entity_description.live:
-            return node_data is not None and bool(self.coordinator.is_reporting(self._barcode))
-        return node_data is not None or self._restored_native_value
+        if not self.entity_description.live:
+            return node_data is not None or self._restored_native_value
+        action = self.coordinator.stale_action
+        if node_data is None:
+            return action == STALE_ACTION_HOLD and self._restored_native_value
+        if not self._stale():
+            return True
+        if action == STALE_ACTION_HOLD:
+            return True
+        return action == STALE_ACTION_ZERO and self.entity_description.key in ZERO_WHEN_STALE
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
+        key = self.entity_description.key
         if node_data:
             value = node_data.get(self.entity_description.value_key)
-            # Convert duty cycle from 0.0-1.0 to percentage
-            if self.entity_description.key == "dc_dc_duty_cycle" and value is not None:
+            if (
+                key in ZERO_WHEN_STALE
+                and self.coordinator.stale_action == STALE_ACTION_ZERO
+                and self._stale()
+            ):
+                # Performance stays unknown when the panel rating is unknown.
+                value = None if key == "performance" and self._module_peak_power <= 0 else 0.0
+            elif key == "dc_dc_duty_cycle" and value is not None:
+                # Convert duty cycle from 0.0-1.0 to percentage
                 value = round(value * 100, 2)
-            elif self.entity_description.key == "status_code" and value is not None:
+            elif key == "status_code" and value is not None:
                 value = f"0x{value:02X}"
             self._attr_native_value = value
             self._restored_native_value = False
         else:
             if not self._restored_native_value:
                 self._attr_native_value = None
+        if self.entity_description.write_on_change:
+            # Only record a state when it actually changes, not every report.
+            written = (self.available, self._attr_native_value, self.extra_state_attributes)
+            if written == self._last_written:
+                return
+            self._last_written = written
         self.async_write_ha_state()
 
     @property
@@ -492,7 +535,7 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         if self._module_string:
             attrs["string_group"] = self._module_string
         last_update = node_data.get("last_update")
-        if last_update:
+        if last_update and not self.entity_description.write_on_change:
             attrs["last_update"] = last_update
         gateway_id = node_data.get("gateway_id")
         if gateway_id is not None:
@@ -518,15 +561,40 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         except ValueError:
             return None
 
-        timezone = dt_util.UTC
-        if self.hass is not None:
-            timezone = dt_util.get_time_zone(self.hass.config.time_zone)
+        return datetime.combine(reset_day, time.min, tzinfo=self._timezone())
 
-        return datetime.combine(reset_day, time.min, tzinfo=timezone)
+    def _timezone(self) -> tzinfo:
+        if self.hass is not None:
+            return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
+        return dt_util.UTC
+
+
+@dataclass
+class _AggregateEnergyData(ExtraStoredData):
+    """Restorable aggregate energy: own total plus each member's last seen value."""
+
+    native_value: float | None
+    native_unit_of_measurement: str | None
+    baselines: dict[str, float]
+    cycle_date: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "native_value": self.native_value,
+            "native_unit_of_measurement": self.native_unit_of_measurement,
+            "baselines": dict(self.baselines),
+            "cycle_date": self.cycle_date,
+        }
 
 
 class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
-    """Aggregate sensor that sums values across multiple optimizers."""
+    """Aggregate across optimizers.
+
+    Live values sum current member readings. Energy totals instead add up each
+    member's *increase* since it was last seen, so membership changes (a panel
+    moved between strings, a newly discovered panel) never add a member's
+    lifetime energy or look like a meter reset in long-term statistics.
+    """
 
     _attr_has_entity_name = True
     entity_description: PyTapAggregateSensorDescription
@@ -546,14 +614,55 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
         self._attr_unique_id = unique_id
         self._attr_device_info = device_info
         self._restored_native_value = False
+        self._energy_total: float | None = None
+        self._baselines: dict[str, float] = {}
+        self._cycle_date: str | None = None
+        self._freshness_unsub: CALLBACK_TYPE | None = None
+
+    @property
+    def _is_energy(self) -> bool:
+        return self.entity_description.key in ("daily_energy", "total_energy")
+
+    @property
+    def _is_daily(self) -> bool:
+        return self.entity_description.key == "daily_energy"
 
     def set_barcodes(self, barcodes: list[str]) -> None:
         """Update aggregate membership without recreating its stable entity."""
+        changed = set(barcodes) != set(self._barcodes)
         self._barcodes = list(barcodes)
+        if changed and self._freshness_unsub is not None:
+            # Follow membership so new members' freshness changes re-render this.
+            self._freshness_unsub()
+            self._freshness_unsub = self.coordinator.async_add_freshness_listener(
+                self._barcodes, self._handle_coordinator_update
+            )
 
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
+        # Every aggregate reports reporting_count, so all follow member freshness.
+        self._freshness_unsub = self.coordinator.async_add_freshness_listener(
+            self._barcodes, self._handle_coordinator_update
+        )
+
+        @callback
+        def unsubscribe_freshness() -> None:
+            if self._freshness_unsub is not None:
+                self._freshness_unsub()
+                self._freshness_unsub = None
+
+        self.async_on_remove(unsubscribe_freshness)
+        if self._is_energy:
+            await self._async_restore_energy()
+            if any(
+                (node := self.coordinator.data.get("nodes", {}).get(barcode)) is not None
+                and node.get(self.entity_description.value_key) is not None
+                for barcode in self._barcodes
+            ):
+                self._handle_coordinator_update()
+            return
+
         if self.entity_description.key == "performance" and any(
             self.coordinator.module_peak_power(barcode) <= 0 for barcode in self._barcodes
         ):
@@ -564,102 +673,154 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
         # Only short-circuit to live data if at least one node already has
         # a non-None value for the aggregate's underlying field. This avoids
         # overwriting a restored value with None from placeholder node dicts.
-        value_key = getattr(self.entity_description, "value_key", None)
-        if self.entity_description.key == "performance":
-            has_fresh_data = any(
-                (node := nodes.get(barcode)) is not None and node.get("power") is not None
-                for barcode in self._barcodes
-            )
-        elif value_key:
-            has_fresh_data = any(
-                (node := nodes.get(barcode)) is not None and node.get(value_key) is not None
-                for barcode in self._barcodes
-            )
-        else:
-            has_fresh_data = False
-
-        if has_fresh_data:
+        value_key = (
+            "power" if self.entity_description.key == "performance" else self.entity_description.value_key
+        )
+        if any(
+            (node := nodes.get(barcode)) is not None and node.get(value_key) is not None
+            for barcode in self._barcodes
+        ):
             self._handle_coordinator_update()
             return
 
-        if restored := await self.async_get_last_sensor_data():
-            if restored.native_value is not None:
-                self._attr_native_value = restored.native_value
-                self._restored_native_value = True
-                return
-
-        restored_state = await self.async_get_last_state()
-        if restored_state is None:
-            return
-
-        native_value = _coerce_restored_state_value(
-            restored_state.state,
-            self.entity_description.key,
-        )
-        if native_value is not None:
+        if (native_value := await self._async_restored_value()) is not None:
             self._attr_native_value = native_value
             self._restored_native_value = True
 
+    async def _async_restored_value(self) -> float | None:
+        if (restored := await self.async_get_last_sensor_data()) is not None:
+            if isinstance(restored.native_value, (int, float)):
+                return float(restored.native_value)
+        if (restored_state := await self.async_get_last_state()) is not None:
+            return _coerce_restored_state_value(restored_state.state, self.entity_description.key)
+        return None
+
+    async def _async_restore_energy(self) -> None:
+        """Restore the own total and member baselines; upgrade from a plain sum."""
+        extra = await self.async_get_last_extra_data()
+        data = extra.as_dict() if extra is not None else {}
+        baselines = data.get("baselines")
+        if isinstance(baselines, dict) and isinstance(data.get("native_value"), (int, float)):
+            self._energy_total = float(data["native_value"])
+            self._baselines = {
+                str(barcode): float(value)
+                for barcode, value in baselines.items()
+                if isinstance(value, (int, float))
+            }
+            cycle_date = data.get("cycle_date")
+            self._cycle_date = cycle_date if isinstance(cycle_date, str) else None
+        elif not self._is_daily:
+            # Earlier versions summed lifetime totals; continue from that value
+            # and treat every member as newly joined (no double counting).
+            self._energy_total = await self._async_restored_value()
+        if self._energy_total is not None:
+            self._attr_native_value = self._energy_total
+            self._restored_native_value = True
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData:
+        if not self._is_energy:
+            return super().extra_restore_state_data
+        return _AggregateEnergyData(
+            self._energy_total, self.native_unit_of_measurement, self._baselines, self._cycle_date
+        )
+
+    def _today(self) -> str:
+        return dt_util.now(self._timezone()).date().isoformat()
+
+    def _timezone(self) -> tzinfo:
+        if self.hass is not None:
+            return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
+        return dt_util.UTC
+
+    def _accumulate_energy(self, nodes: dict[str, Any]) -> None:
+        if self._is_daily and self._cycle_date != (today := self._today()):
+            self._cycle_date = today
+            self._energy_total = 0.0 if self._energy_total is not None else None
+        values = {
+            barcode: float(value)
+            for barcode in self._barcodes
+            if (node := nodes.get(barcode)) is not None
+            and isinstance(value := node.get(self.entity_description.value_key), (int, float))
+        }
+        if self._energy_total is None:
+            # First ever value: start from the members' current totals.
+            self._energy_total = sum(values.values()) if values else None
+        else:
+            for barcode, value in values.items():
+                previous = self._baselines.get(barcode)
+                # New members and member resets (e.g. midnight) only rebase.
+                if previous is not None and value > previous:
+                    self._energy_total += value - previous
+        self._baselines = values if self._energy_total is not None else {}
+
     def _members(self) -> list[str]:
-        """Members whose data counts: only currently reporting panels for live values."""
+        """Members whose data counts; live values may exclude stale panels."""
         nodes = self.coordinator.data.get("nodes", {})
-        if self.entity_description.live:
-            return [
-                b for b in self._barcodes if nodes.get(b) is not None and self.coordinator.is_reporting(b)
-            ]
-        return [b for b in self._barcodes if nodes.get(b) is not None]
+        present = [b for b in self._barcodes if nodes.get(b) is not None]
+        if not self.entity_description.live or self.coordinator.stale_action == STALE_ACTION_HOLD:
+            return present
+        return [b for b in present if self.coordinator.is_reporting(b)]
 
     @property
     def available(self) -> bool:
         """Return True when at least one constituent has (current) data."""
         if not self.coordinator.data:
             return False
-        if self.entity_description.live:
-            return bool(self._members())
-        return bool(self._members()) or self._restored_native_value
+        if not self.entity_description.live or self.coordinator.stale_action == STALE_ACTION_HOLD:
+            return bool(self._members()) or self._restored_native_value
+        if self.coordinator.stale_action == STALE_ACTION_ZERO:
+            nodes = self.coordinator.data.get("nodes", {})
+            return any(nodes.get(b) is not None for b in self._barcodes)
+        return bool(self._members())
+
+    def _unrated(self) -> bool:
+        return any(self.coordinator.module_peak_power(barcode) <= 0 for barcode in self._barcodes)
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         nodes = self.coordinator.data.get("nodes", {})
-        members = self._members()
 
+        if self._is_energy:
+            self._accumulate_energy(nodes)
+            if self._energy_total is not None:
+                self._attr_native_value = round(self._energy_total, 2)
+                self._restored_native_value = False
+            self.async_write_ha_state()
+            return
+
+        members = self._members()
         if not members:
-            if not self._restored_native_value:
+            if self.entity_description.live and self.coordinator.stale_action == STALE_ACTION_ZERO:
+                # Connected but nothing reporting (e.g. night): zero output.
+                unknown = self.entity_description.key == "performance" and self._unrated()
+                self._attr_native_value = None if unknown else 0.0
+                self._restored_native_value = False
+            elif not self._restored_native_value:
                 self._attr_native_value = None
             self.async_write_ha_state()
             return
 
         if self.entity_description.key == "performance":
-            if any(self.coordinator.module_peak_power(barcode) <= 0 for barcode in self._barcodes):
+            if self._unrated():
+                # Reporting a percentage for only the rated subset would
+                # misrepresent the entire group/installation performance.
                 self._attr_native_value = None
                 self._restored_native_value = False
                 self.async_write_ha_state()
                 return
             total_power = 0.0
             total_peak_power = 0.0
-
             for barcode in members:
                 node_data = nodes[barcode]
-
                 power = node_data.get("power")
-                peak_power = node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
                 if power is None:
                     continue
-
                 try:
-                    peak_power_value = float(peak_power)
+                    peak_power_value = float(node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER))
                 except (TypeError, ValueError):
                     peak_power_value = float(DEFAULT_PEAK_POWER)
-
-                if peak_power_value <= 0:
-                    # Reporting a percentage for only the rated subset would
-                    # misrepresent the entire group/installation performance.
-                    self._attr_native_value = None
-                    self._restored_native_value = False
-                    self.async_write_ha_state()
-                    return
-
                 total_power += max(power, 0.0)
                 total_peak_power += peak_power_value
 
@@ -668,12 +829,10 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
             else:
                 self._attr_native_value = None
             self._restored_native_value = False
-
             self.async_write_ha_state()
             return
 
         total: float | None = None
-
         for barcode in members:
             value = nodes[barcode].get(self.entity_description.value_key)
             if value is not None:
@@ -685,15 +844,15 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
 
     @property
     def last_reset(self) -> datetime | None:
-        """Return last reset for aggregate daily energy."""
-        if self.entity_description.key != "daily_energy":
+        """Return last reset for aggregate daily energy (start of its own cycle)."""
+        if not self._is_daily:
             return None
-
-        timezone = dt_util.UTC
-        if self.hass is not None:
-            timezone = dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.UTC
-
-        return datetime.combine(dt_util.now(timezone).date(), time.min, tzinfo=timezone)
+        cycle = self._cycle_date or self._today()
+        try:
+            cycle_day = date.fromisoformat(cycle)
+        except ValueError:
+            cycle_day = date.fromisoformat(self._today())
+        return datetime.combine(cycle_day, time.min, tzinfo=self._timezone())
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

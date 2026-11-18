@@ -4,7 +4,7 @@ Implements menu-driven setup with passive automatic discovery or a manual
 optimizer allowlist. Discovered metadata can be edited through options.
 
 Flow: user (transport menu) → tcp / serial → modules_menu → add_module → finish
-Options: init (menu) → module edits / discovery / connection / reporting → done
+Options: init (menu) → module edits / discovery / connection / reporting / stale readings → done
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import uuid
 
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -24,7 +25,15 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.selector import SerialPortSelector
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+    SerialPortSelector,
+)
 import serialx
 import voluptuous as vol
 
@@ -34,7 +43,7 @@ from .connection import (
     connection_title,
     normalize_connection,
     open_source,
-    serial_endpoint_key,
+    resolved_endpoint_key,
 )
 from .const import (
     CONF_AUTO_DISCOVERY,
@@ -48,6 +57,8 @@ from .const import (
     CONF_MODULE_STRING,
     CONF_MODULES,
     CONF_SERIAL_PORT,
+    CONF_STALE_ACTION,
+    CONF_STALE_TIMEOUT,
     CONF_WRITE_INTERVAL,
     CONNECTION_SERIAL,
     CONNECTION_TCP,
@@ -55,10 +66,15 @@ from .const import (
     DEFAULT_LIVE_REPORTING,
     DEFAULT_PEAK_POWER,
     DEFAULT_PORT,
+    DEFAULT_STALE_ACTION,
+    DEFAULT_STALE_TIMEOUT,
     DEFAULT_WRITE_INTERVAL,
     DOMAIN,
+    MAX_STALE_TIMEOUT,
     MAX_WRITE_INTERVAL,
+    MIN_STALE_TIMEOUT,
     MIN_WRITE_INTERVAL,
+    STALE_ACTIONS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -115,37 +131,54 @@ async def validate_connection(hass: HomeAssistant, data: dict[str, Any]) -> dict
 
     # Shield the executor job: cancelling a flow must not cancel ownership of
     # its open attempt. The bounded backend operation still closes in finally.
-    await asyncio.shield(hass.async_add_executor_job(_test_connection))
+    probe = hass.async_add_executor_job(_test_connection)
+    # If the flow is cancelled first, still retrieve the result so asyncio
+    # doesn't log "Future exception was never retrieved".
+    probe.add_done_callback(lambda done: done.cancelled() or done.exception())
+    await asyncio.shield(probe)
     return {"title": connection_title(settings)}
 
 
-def serial_port_claimed(hass: HomeAssistant, settings: dict[str, Any], entry_id: str | None = None) -> bool:
+async def _same_serial_port(hass: HomeAssistant, first: str, second: str) -> bool:
+    """Compare endpoints after resolving symlinks such as /dev/serial/by-id."""
+    return await hass.async_add_executor_job(
+        lambda: resolved_endpoint_key(first) == resolved_endpoint_key(second)
+    )
+
+
+async def serial_port_claimed(
+    hass: HomeAssistant, settings: dict[str, Any], entry_id: str | None = None
+) -> bool:
     """Avoid probing or saving a serial port owned by another PyTap entry."""
     if settings[CONF_CONNECTION_TYPE] != CONNECTION_SERIAL:
         return False
-    return any(
-        entry.entry_id != entry_id
-        and entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_SERIAL
-        and serial_endpoint_key(entry.data.get(CONF_SERIAL_PORT, ""))
-        == serial_endpoint_key(settings[CONF_SERIAL_PORT])
-        for entry in hass.config_entries.async_entries(DOMAIN)
-    )
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if (
+            entry.entry_id != entry_id
+            and entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_SERIAL
+            and await _same_serial_port(
+                hass, entry.data.get(CONF_SERIAL_PORT, ""), settings[CONF_SERIAL_PORT]
+            )
+        ):
+            return True
+    return False
 
 
 async def connection_errors(
     hass: HomeAssistant,
     settings: dict[str, Any],
     entry: ConfigEntry | None = None,
+    *,
+    accept_unreachable: bool = False,
 ) -> dict[str, str]:
-    """Reject invalid settings but keep temporary connectivity warn-only."""
-    if serial_port_claimed(hass, settings, entry.entry_id if entry else None):
+    """Reject invalid settings; an unreachable endpoint needs a second submit to save."""
+    if await serial_port_claimed(hass, settings, entry.entry_id if entry else None):
         return {CONF_SERIAL_PORT: "serial_port_in_use"}
     if (
         entry is not None
         and settings[CONF_CONNECTION_TYPE] == CONNECTION_SERIAL
         and entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_SERIAL
-        and serial_endpoint_key(entry.data.get(CONF_SERIAL_PORT, ""))
-        == serial_endpoint_key(settings[CONF_SERIAL_PORT])
+        and await _same_serial_port(hass, entry.data.get(CONF_SERIAL_PORT, ""), settings[CONF_SERIAL_PORT])
     ):
         # The running listener owns this port; reload applies any baud change.
         return {}
@@ -156,10 +189,12 @@ async def connection_errors(
     except Exception as err:
         # Backend messages can contain complete URLs and hardware identities.
         _LOGGER.warning(
-            "Could not connect using %s (%s) — saving for retry",
+            "Could not connect using %s (%s)",
             settings[CONF_CONNECTION_TYPE],
             type(err).__name__,
         )
+        if not accept_unreachable:
+            return {"base": "cannot_connect"}
     return {}
 
 
@@ -190,6 +225,8 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
         self._user_data: dict[str, Any] = {}
         self._modules: list[dict[str, Any]] = []
         self._auto_discovery = True
+        # Settings whose probe failed; submitting them again saves anyway.
+        self._unreachable: dict[str, Any] | None = None
 
     @staticmethod
     @callback
@@ -219,7 +256,10 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
             except InvalidConnectionSettings as err:
                 errors[err.field] = err.error
             else:
-                errors = await connection_errors(self.hass, settings)
+                errors = await connection_errors(
+                    self.hass, settings, accept_unreachable=settings == self._unreachable
+                )
+                self._unreachable = settings if errors == {"base": "cannot_connect"} else None
                 if not errors:
                     self._user_data = settings
                     await self.async_set_unique_id(uuid.uuid4().hex)
@@ -306,7 +346,7 @@ class PyTapConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors={"base": "no_modules"},
                 description_placeholders={"modules_list": _modules_description(self._modules)},
             )
-        if serial_port_claimed(self.hass, self._user_data):
+        if await serial_port_claimed(self.hass, self._user_data):
             # Another flow may have claimed the port while modules were added.
             return self.async_show_form(
                 step_id="serial",
@@ -335,12 +375,12 @@ class PyTapOptionsFlow(OptionsFlow):
         self._auto_discovery = config_entry.data.get(CONF_AUTO_DISCOVERY, False)
         self._excluded_barcodes = set(config_entry.data.get(CONF_EXCLUDED_BARCODES, []))
         self._editing_barcode: str | None = None
+        self._unreachable: dict[str, Any] | None = None
 
     def _current_modules(self) -> list[dict[str, Any]]:
         """Read the live discovery catalogue without opening or changing a port."""
-        coordinator = self.hass.data.get(DOMAIN, {}).get(self._config_entry.entry_id)
-        if coordinator is not None:
-            return coordinator.modules
+        if self._config_entry.state is ConfigEntryState.LOADED:
+            return self._config_entry.runtime_data.modules
         return [dict(module) for module in self._config_entry.data.get(CONF_MODULES, [])]
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
@@ -354,6 +394,7 @@ class PyTapOptionsFlow(OptionsFlow):
             menu_options=[
                 "change_connection",
                 "change_reporting",
+                "change_stale",
                 "change_discovery",
                 "add_module",
                 "edit_module",
@@ -478,7 +519,10 @@ class PyTapOptionsFlow(OptionsFlow):
             except InvalidConnectionSettings as err:
                 errors[err.field] = err.error
             else:
-                errors = await connection_errors(self.hass, settings, self._config_entry)
+                errors = await connection_errors(
+                    self.hass, settings, self._config_entry, accept_unreachable=settings == self._unreachable
+                )
+                self._unreachable = settings if errors == {"base": "cannot_connect"} else None
                 if not errors:
                     new_data = {
                         key: value
@@ -557,6 +601,48 @@ class PyTapOptionsFlow(OptionsFlow):
             data_schema=schema,
         )
 
+    async def async_step_change_stale(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Choose what live panel readings do once a panel stops reporting."""
+        if user_input is not None:
+            new_data = {
+                **self._config_entry.data,
+                CONF_STALE_ACTION: user_input[CONF_STALE_ACTION],
+                CONF_STALE_TIMEOUT: int(user_input[CONF_STALE_TIMEOUT]),
+            }
+            self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+            return await self.async_step_init()
+
+        data = self._config_entry.data
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_STALE_ACTION, default=data.get(CONF_STALE_ACTION, DEFAULT_STALE_ACTION)
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=list(STALE_ACTIONS),
+                        mode=SelectSelectorMode.DROPDOWN,
+                        translation_key=CONF_STALE_ACTION,
+                    )
+                ),
+                vol.Required(
+                    CONF_STALE_TIMEOUT, default=data.get(CONF_STALE_TIMEOUT, DEFAULT_STALE_TIMEOUT)
+                ): vol.All(
+                    NumberSelector(
+                        NumberSelectorConfig(
+                            min=MIN_STALE_TIMEOUT,
+                            max=MAX_STALE_TIMEOUT,
+                            step=1,
+                            unit_of_measurement="s",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_STALE_TIMEOUT, max=MAX_STALE_TIMEOUT),
+                ),
+            }
+        )
+        return self.async_show_form(step_id="change_stale", data_schema=schema)
+
     async def async_step_add_module(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Add a single module in options flow."""
         errors: dict[str, str] = {}
@@ -630,14 +716,6 @@ class PyTapOptionsFlow(OptionsFlow):
             step_id="remove_module",
             data_schema=schema,
         )
-
-
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-class InvalidAuth(HomeAssistantError):
-    """Error to indicate there is invalid auth."""
 
 
 class InvalidModuleFormat(HomeAssistantError):

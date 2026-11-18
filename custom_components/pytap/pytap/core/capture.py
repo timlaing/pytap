@@ -31,18 +31,61 @@ MAX_RECORD_BYTES = 65536
 FORMAT_VERSION = 1
 MANIFEST_RESERVE = 1024 * 1024
 FREE_SPACE_RESERVE = 64 * 1024 * 1024
-CAPTURE_ID_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[a-f0-9]{12}$")
-_SEGMENT_PATTERN = re.compile(r"^bus-\d{6}\.bin$")
+MANIFEST_INTERVAL = 10.0
+EVENTS_FILE = "events.jsonl"
+CAPTURE_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z_[a-f0-9]{12}$")
+_SEGMENT_PATTERN = re.compile(r"^bus-[0-9]{6}\.bin$")
+_UNLISTED_PATTERN = re.compile(r"^(?:bus|chunks)-[0-9]{6}\.bin$")
+_ARCHIVE_PATTERN = re.compile(r"^(?P<capture_id>[0-9]{8}T[0-9]{6}Z_[a-f0-9]{12})-[a-f0-9]{8}\.zip$")
+_SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+_STATES = frozenset({"idle", "starting", "capturing", "stopping", "stopped", "error"})
+_COUNTERS = (
+    "bytes_observed",
+    "bytes_written",
+    "records_written",
+    "dropped_bytes",
+    "dropped_records",
+    "session_budget_bytes",
+    "storage_bytes_used",
+    "max_storage_bytes",
+    "queue_depth",
+)
+
+
+class CaptureError(ValueError):
+    """A code-authored, user-actionable condition; safe to show and translate."""
+
+    def __init__(self, translation_key: str, message: str, **placeholders: str) -> None:
+        super().__init__(message)
+        self.translation_key = translation_key
+        self.translation_placeholders = placeholders
+
+
+def _mib(value: int) -> str:
+    return str(max(0, -(-value // (1024 * 1024))))
 
 
 def _private_file(path: Path) -> BinaryIO:
     return os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb")
 
 
-def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    data = json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode()
-    if len(data) > MANIFEST_RESERVE:
-        raise ValueError("Capture manifest exceeds reserved storage")
+def _fsync_dir(path: Path) -> None:
+    """Best-effort durability for directory entries (POSIX only)."""
+    if os.name != "posix":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
     temp = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".manifest-", delete=False) as handle:
@@ -55,6 +98,7 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     finally:
         if temp is not None:
             temp.unlink(missing_ok=True)
+    _fsync_dir(path.parent)
 
 
 def _tree_size(root: Path) -> int:
@@ -124,16 +168,19 @@ class CaptureWriter:
         self._events: BinaryIO | None = None
         self._raw_hash = hashlib.sha256()
         self._index_hash = hashlib.sha256()
+        self._events_hash = hashlib.sha256()
+        self._events_bytes = 0
+        self._manifest_data: bytes | None = None
 
     @property
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, include_directory: bool = False) -> dict[str, Any]:
+        """Counters only; the local path is opt-in for admin responses."""
         with self._lock:
-            return {
+            status = {
                 "capture_id": self.capture_id,
-                "directory": str(self.directory),
                 "state": self._state,
                 "stop_reason": self._reason,
                 "error": self._error,
@@ -154,6 +201,9 @@ class CaptureWriter:
                 "storage_bytes_used": self._used_bytes,
                 "queue_depth": self._queue.qsize(),
             }
+        if include_directory:
+            status["directory"] = str(self.directory)
+        return status
 
     def start(self) -> None:
         """Prepare private files and start the writer; call off an event loop."""
@@ -170,9 +220,14 @@ class CaptureWriter:
                 shutil.disk_usage(self.root).free - FREE_SPACE_RESERVE,
             )
             if self._session_budget <= MANIFEST_RESERVE:
-                raise OSError("Capture storage budget exhausted")
+                raise CaptureError(
+                    "storage_budget_exhausted",
+                    "Capture storage budget exhausted",
+                    available_mib=_mib(self._session_budget),
+                )
             self.directory.mkdir(mode=0o700)
-            self._events = _private_file(self.directory / "events.jsonl")
+            _fsync_dir(self.root)
+            self._events = _private_file(self.directory / EVENTS_FILE)
             self._open_segment()
             with self._lock:
                 if not self._stop.is_set():
@@ -236,21 +291,29 @@ class CaptureWriter:
             if time.monotonic() >= self._deadline:
                 self._stop_locked("duration_limit")
                 return
-            if not self._bootstrap_done and bootstrap is not None:
-                try:
-                    # This callback runs in the sole listener before parsing
-                    # the first admitted read, not during async file preparation.
-                    self.metadata["parser_state"] = dict(bootstrap())
-                    self.metadata["parser_state_at_capture_boundary"] = True
-                    self._bootstrap_done = True
-                except Exception as err:
+            snapshot_needed = not self._bootstrap_done and bootstrap is not None
+        snapshot = None
+        if snapshot_needed:
+            # Called by the sole listener before it parses this read, so the
+            # parser cannot advance meanwhile; status() never waits on this.
+            try:
+                snapshot = dict(bootstrap())
+            except Exception as err:
+                with self._lock:
                     self._error = type(err).__name__
                     self._dropped_records += 1
                     self._dropped_bytes += len(data)
                     self._observed_bytes += len(data)
                     self._stop_locked("bootstrap_error")
                     self._state = "error"
-                    return
+                return
+        with self._lock:
+            if not self._accepting:
+                return
+            if snapshot is not None and not self._bootstrap_done:
+                self.metadata["parser_state"] = snapshot
+                self.metadata["parser_state_at_capture_boundary"] = True
+                self._bootstrap_done = True
             chunk = CapturedChunk(
                 time.time_ns(), time.monotonic_ns(), self._observed_bytes, connection_id, bytes(data)
             )
@@ -367,6 +430,7 @@ class CaptureWriter:
             if segment["bytes"] == self.segment_bytes:
                 self._close_segment()
                 self._open_segment()
+                self._write_manifest()
                 segment = self._segments[-1]
             length = min(len(chunk.data) - consumed, self.segment_bytes - segment["bytes"], MAX_RECORD_BYTES)
             data = chunk.data[consumed : consumed + length]
@@ -386,22 +450,50 @@ class CaptureWriter:
                 self._written_records += 1
         return True
 
+    def _write_event(self, data: bytes) -> None:
+        assert self._events is not None
+        self._events.write(data)
+        self._events_hash.update(data)
+        self._events_bytes += len(data)
+        self._used_bytes += len(data)
+
+    def _sync_data(self) -> None:
+        """Make referenced bytes durable before a manifest can vouch for them."""
+        for handle in (self._raw, self._index, self._events):
+            if handle is not None:
+                handle.flush()
+                os.fsync(handle.fileno())
+
     def _write_manifest(self) -> None:
+        """Rewrite only on change; data files are fsynced first, then the directory."""
         with self._lock:
             metadata = dict(self.metadata)
         segments = [dict(segment) for segment in self._segments]
         if segments:
             segments[-1].update(sha256=self._raw_hash.hexdigest(), index_sha256=self._index_hash.hexdigest())
-        _atomic_json(
-            self.directory / "manifest.json",
+        data = json.dumps(
             {
                 **self.status(),
                 "format_version": FORMAT_VERSION,
                 "index_format": INDEX.format,
                 "metadata": metadata,
                 "segments": segments,
+                "events": {
+                    "file": EVENTS_FILE,
+                    "bytes": self._events_bytes,
+                    "sha256": self._events_hash.hexdigest(),
+                },
             },
-        )
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        if len(data) > MANIFEST_RESERVE:
+            raise ValueError("Capture manifest exceeds reserved storage")
+        if data == self._manifest_data:
+            return
+        self._sync_data()
+        _atomic_write(self.directory / "manifest.json", data)
+        self._manifest_data = data
 
     def _try_manifest(self) -> None:
         try:
@@ -411,7 +503,7 @@ class CaptureWriter:
             self._fail(err, "disk_error")
 
     def _run(self) -> None:
-        last_flush = time.monotonic()
+        last_flush = last_manifest = time.monotonic()
         current = None
         written_before = self._written_bytes
         try:
@@ -435,19 +527,20 @@ class CaptureWriter:
                         self._drop(current)
                         current = None
                         break
-                    assert self._events is not None
-                    self._events.write(data)
-                    self._used_bytes += len(data)
+                    self._write_event(data)
                 current = None
-                if time.monotonic() - last_flush >= 1:
+                now = time.monotonic()
+                if now - last_flush >= 1:
                     for handle in (self._raw, self._index, self._events):
                         if handle is not None:
                             handle.flush()
-                    self._write_manifest()
-                    last_flush = time.monotonic()
+                    last_flush = now
                     if shutil.disk_usage(self.directory).free < FREE_SPACE_RESERVE // 2:
                         self.request_stop("disk_space_low")
                         break
+                if now - last_manifest >= MANIFEST_INTERVAL:
+                    self._write_manifest()
+                    last_manifest = now
         except BaseException as err:
             if current is not None:
                 remaining = (
@@ -474,12 +567,70 @@ class CaptureWriter:
 
 def capture_directory(root: Path, capture_id: str) -> Path:
     """Resolve a generated session ID, never an arbitrary caller-supplied path."""
-    if not CAPTURE_ID_PATTERN.fullmatch(capture_id):
-        raise ValueError("Invalid capture ID")
+    if not isinstance(capture_id, str) or not CAPTURE_ID_PATTERN.fullmatch(capture_id):
+        raise CaptureError("invalid_capture_id", "Invalid capture ID")
     directory = root / capture_id
     if directory.is_symlink() or not directory.is_dir():
-        raise ValueError("Capture directory is unavailable")
+        raise CaptureError("capture_not_found", "Capture directory is unavailable", capture_id=capture_id)
     return directory
+
+
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_digest(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
+
+
+def _validate_manifest(manifest: Any, directory: Path) -> None:
+    if not isinstance(manifest, dict):
+        raise ValueError("Invalid capture manifest")
+    if manifest.get("format_version") != FORMAT_VERSION or manifest.get("index_format") != INDEX.format:
+        raise ValueError("Unsupported capture format")
+    if manifest.get("capture_id") != directory.name or not CAPTURE_ID_PATTERN.fullmatch(directory.name):
+        raise ValueError("Capture manifest does not match its directory")
+    if manifest.get("state") not in _STATES or type(manifest.get("complete")) is not bool:
+        raise ValueError("Invalid capture manifest state")
+    if not all(_is_count(manifest.get(key)) for key in _COUNTERS):
+        raise ValueError("Invalid capture manifest counters")
+    for key in ("started_utc_ns", "ended_utc_ns", "stop_reason", "error"):
+        value = manifest.get(key)
+        if value is not None and not (_is_count(value) if key.endswith("_ns") else isinstance(value, str)):
+            raise ValueError("Invalid capture manifest timestamps or reasons")
+    duration = manifest.get("duration_seconds")
+    if (
+        type(duration) not in (int, float)
+        or not duration > 0
+        or not isinstance(manifest.get("metadata"), dict)
+    ):
+        raise ValueError("Invalid capture manifest metadata")
+    events = manifest.get("events")
+    if (
+        not isinstance(events, dict)
+        or events.get("file") != EVENTS_FILE
+        or not _is_count(events.get("bytes"))
+        or not _is_digest(events.get("sha256"))
+    ):
+        raise ValueError("Invalid capture manifest event log")
+    segments = manifest.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("Invalid capture manifest segments")
+    for number, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError("Invalid capture manifest segment")
+        name = segment.get("file")
+        if not isinstance(name, str) or not _SEGMENT_PATTERN.fullmatch(name):
+            raise ValueError("Unsafe segment filename")
+        if name != f"bus-{number:06d}.bin" or segment.get("index") != f"chunks-{number:06d}.bin":
+            raise ValueError("Invalid segment index filename")
+        if not (
+            _is_count(segment.get("bytes"))
+            and _is_count(segment.get("records"))
+            and _is_digest(segment.get("sha256"))
+            and _is_digest(segment.get("index_sha256"))
+        ):
+            raise ValueError("Invalid capture manifest segment counters")
 
 
 def read_manifest(directory: Path, *, allow_incomplete: bool = False) -> dict[str, Any]:
@@ -489,11 +640,8 @@ def read_manifest(directory: Path, *, allow_incomplete: bool = False) -> dict[st
     if path.stat().st_size > MANIFEST_RESERVE:
         raise ValueError("Capture manifest is too large")
     manifest = json.loads(path.read_text())
-    if not isinstance(manifest, dict):
-        raise ValueError("Invalid capture manifest")
-    if manifest.get("format_version") != FORMAT_VERSION or manifest.get("index_format") != INDEX.format:
-        raise ValueError("Unsupported capture format")
-    if not allow_incomplete and (manifest.get("state") != "stopped" or not manifest.get("complete")):
+    _validate_manifest(manifest, directory)
+    if not allow_incomplete and (manifest["state"] != "stopped" or not manifest["complete"]):
         raise ValueError("Capture is incomplete; explicitly allow incomplete evidence to inspect it")
     return manifest
 
@@ -511,64 +659,84 @@ def _segment_paths(directory: Path, segment: Mapping[str, Any]) -> tuple[Path, P
     return paths
 
 
-def iter_capture(directory: Path, *, allow_incomplete: bool = False) -> Iterator[CapturedChunk]:
-    """Validate and stream a stopped capture. No packet type is filtered."""
+def _events_path(directory: Path) -> Path:
+    path = directory / EVENTS_FILE
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Capture event log must be a regular file")
+    return path
+
+
+def _verify_file(path: Path, size: int, digest: str, strict: bool, warn: Callable[[str], None]) -> None:
+    if path.stat().st_size != size:
+        if strict:
+            raise ValueError("Capture size mismatch (possibly an interrupted write)")
+        warn("Incomplete evidence has stale file sizes")
+    with path.open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+            if strict:
+                raise ValueError("Capture checksum mismatch")
+            warn("Incomplete evidence has unverified checksums")
+
+
+def _warn(message: str) -> None:
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+
+def _iter_capture(
+    directory: Path, allow_incomplete: bool, warn: Callable[[str], None]
+) -> Iterator[CapturedChunk]:
     manifest = read_manifest(directory, allow_incomplete=allow_incomplete)
-    strict = not allow_incomplete or bool(manifest["complete"])
+    strict = not allow_incomplete or manifest["complete"]
+    events = manifest["events"]
+    _verify_file(_events_path(directory), events["bytes"], events["sha256"], strict, warn)
     previous_offset = 0
     total_bytes = 0
+    halted = False
     for segment in manifest["segments"]:
         raw_path, index_path = _segment_paths(directory, segment)
-        for path, count, digest in (
-            (raw_path, segment["bytes"], segment.get("sha256")),
-            (index_path, segment["records"] * INDEX.size, segment.get("index_sha256")),
-        ):
-            if path.stat().st_size != count:
-                if strict:
-                    raise ValueError("Capture size mismatch (possibly an interrupted write)")
-                warnings.warn("Incomplete evidence has stale file sizes", RuntimeWarning, stacklevel=2)
-            with path.open("rb") as handle:
-                if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
-                    if strict:
-                        raise ValueError("Capture checksum mismatch")
-                    warnings.warn(
-                        "Incomplete evidence has unverified checksums", RuntimeWarning, stacklevel=2
-                    )
+        _verify_file(raw_path, segment["bytes"], segment["sha256"], strict, warn)
+        _verify_file(index_path, segment["records"] * INDEX.size, segment["index_sha256"], strict, warn)
         with raw_path.open("rb") as raw, index_path.open("rb") as index:
             while record := index.read(INDEX.size):
                 if len(record) != INDEX.size:
                     if strict:
                         raise ValueError("Truncated chunk index")
-                    warnings.warn(
-                        "Incomplete evidence ends with a partial index row", RuntimeWarning, stacklevel=2
-                    )
+                    warn("Incomplete evidence ends with a partial index row")
                     break
                 utc_ns, mono_ns, offset, length, connection = INDEX.unpack(record)
                 if not 0 < length <= MAX_RECORD_BYTES or offset < previous_offset:
-                    raise ValueError("Invalid chunk ordering or length")
+                    if strict:
+                        raise ValueError("Invalid chunk ordering or length")
+                    # E.g. a zero-filled tail after power loss; nothing later is trustworthy.
+                    warn("Incomplete evidence has an invalid index row; replay stops there")
+                    halted = True
+                    break
                 data = raw.read(length)
                 if len(data) != length:
                     if strict:
                         raise ValueError("Truncated capture data")
-                    warnings.warn(
-                        "Incomplete evidence ends with a partial data chunk", RuntimeWarning, stacklevel=2
-                    )
+                    warn("Incomplete evidence ends with a partial data chunk")
                 previous_offset = offset + len(data)
                 total_bytes += len(data)
                 if data:
                     yield CapturedChunk(utc_ns, mono_ns, offset, connection, data, length)
                 if len(data) != length:
                     break
-            if raw.read(1):
+            if not halted and raw.read(1):
                 if strict:
                     raise ValueError("Unindexed capture bytes")
-                warnings.warn(
-                    "Unindexed tail retained in raw file, not replayed", RuntimeWarning, stacklevel=2
-                )
+                warn("Unindexed tail retained in raw file, not replayed")
+        if halted:
+            break
     if total_bytes != manifest["bytes_written"]:
         if strict:
             raise ValueError("Capture byte count mismatch")
-        warnings.warn("Incomplete evidence has a stale byte count", RuntimeWarning, stacklevel=2)
+        warn("Incomplete evidence has a stale byte count")
+
+
+def iter_capture(directory: Path, *, allow_incomplete: bool = False) -> Iterator[CapturedChunk]:
+    """Validate and stream a stopped capture. No packet type is filtered."""
+    return _iter_capture(directory, allow_incomplete, _warn)
 
 
 def list_captures(root: Path, limit: int = 20) -> list[dict[str, Any]]:
@@ -603,32 +771,52 @@ def list_captures(root: Path, limit: int = 20) -> list[dict[str, Any]]:
     return result
 
 
-def export_archive(directory: Path, *, allow_interrupted: bool = False) -> Path:
-    """Archive stopped evidence, including incomplete captures with clear flags."""
+def export_archive(
+    directory: Path, *, allow_interrupted: bool = False, max_storage_bytes: int | None = None
+) -> Path:
+    """Archive stopped evidence, including incomplete captures with clear flags.
+
+    With max_storage_bytes, the archive (estimated as the sum of its inputs)
+    must fit in what remains of the capture root's storage budget.
+    """
     manifest = read_manifest(directory, allow_incomplete=True)
     if manifest["state"] not in ("stopped", "error") and not allow_interrupted:
-        raise ValueError("Stop capture before exporting")
+        raise CaptureError("stop_before_export", "Stop capture before exporting")
     # The HA controller rejects a live writer. A stale 'capturing' manifest
     # after a crash is incomplete evidence and must still be recoverable.
     # Validate every byte; incomplete evidence is explicitly marked/warned and
     # preserved verbatim, never "repaired" or declared complete.
-    for _ in iter_capture(directory, allow_incomplete=True):
+    issues: list[str] = []
+    for _ in _iter_capture(directory, True, issues.append):
         pass
-    paths = [directory / "manifest.json", directory / "events.jsonl"]
+    issues = list(dict.fromkeys(issues))
+    for message in issues:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    paths = [directory / "manifest.json", _events_path(directory)]
     for segment in manifest["segments"]:
         paths.extend(_segment_paths(directory, segment))
-    unverified = []
+    unlisted = []
     if not manifest["complete"]:
         listed = {path.name for path in paths}
         for path in sorted(directory.iterdir()):
-            if re.fullmatch(r"(?:bus|chunks)-\d{6}\.bin", path.name) and path.name not in listed:
+            if _UNLISTED_PATTERN.fullmatch(path.name) and path.name not in listed:
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("Unsafe unlisted segment")
                 paths.append(path)
-                unverified.append(path.name)
+                unlisted.append(path.name)
     if any(path.is_symlink() or not path.is_file() for path in paths):
         raise ValueError("Unsafe archive input")
-    if shutil.disk_usage(directory).free < sum(path.stat().st_size for path in paths) + FREE_SPACE_RESERVE:
+    expected = sum(path.stat().st_size for path in paths)
+    if max_storage_bytes is not None:
+        available = max_storage_bytes - _tree_size(directory.parent)
+        if expected > available:
+            raise CaptureError(
+                "export_budget_exceeded",
+                "Export would exceed the capture storage budget",
+                required_mib=_mib(expected),
+                available_mib=_mib(available),
+            )
+    if shutil.disk_usage(directory).free < expected + FREE_SPACE_RESERVE:
         raise OSError("Insufficient export space")
     output = directory.parent / f"{directory.name}-{uuid.uuid4().hex[:8]}.zip"
     try:
@@ -638,15 +826,17 @@ def export_archive(directory: Path, *, allow_interrupted: bool = False) -> Path:
         ):
             for path in paths:
                 archive.write(path, arcname=f"{directory.name}/{path.name}")
-            if unverified:
+            if not manifest["complete"]:
                 archive.writestr(
                     f"{directory.name}/recovery.json",
                     json.dumps(
                         {
                             "complete": False,
-                            "unverified_files": unverified,
-                            "note": "Unlisted crash segments preserved verbatim; "
-                            "unverified and not timestamp-replayed",
+                            "verified": not issues and not unlisted,
+                            "validation_warnings": issues,
+                            "unverified_files": unlisted,
+                            "note": "Incomplete evidence archived verbatim; files with validation warnings "
+                            "or unlisted crash segments are unverified and not timestamp-replayed",
                         }
                     ),
                 )
@@ -654,3 +844,44 @@ def export_archive(directory: Path, *, allow_interrupted: bool = False) -> Path:
         output.unlink(missing_ok=True)
         raise
     return output
+
+
+def _capture_archives(root: Path, capture_id: str) -> list[Path]:
+    return [
+        path
+        for path in root.iterdir()
+        if (match := _ARCHIVE_PATTERN.fullmatch(path.name)) and match["capture_id"] == capture_id
+    ]
+
+
+def delete_capture(root: Path, capture_id: str) -> dict[str, Any]:
+    """Delete one capture and its exports; the caller must exclude the active session."""
+    root = Path(root)
+    if root.is_symlink():
+        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
+    directory = capture_directory(root, capture_id)
+    entries = list(directory.iterdir())
+    archives = _capture_archives(root, capture_id)
+    # Validate everything first so a refusal never leaves a half-deleted capture.
+    if any(path.is_symlink() or not path.is_file() for path in (*entries, *archives)):
+        raise CaptureError("capture_unsafe", "Capture contains unexpected entries")
+    deleted = 0
+    for path in (*archives, *entries):
+        deleted += path.lstat().st_size
+        path.unlink()
+    directory.rmdir()
+    _fsync_dir(root)
+    return {"capture_id": capture_id, "deleted_archives": len(archives), "deleted_bytes": deleted}
+
+
+def remove_capture_root(root: Path) -> bool:
+    """Delete an instance's entire capture root without following a symlinked root."""
+    root = Path(root)
+    if root.is_symlink():
+        raise CaptureError("capture_unsafe", "Capture root must not be a symlink")
+    if not root.exists():
+        return False
+    if not root.is_dir():
+        raise CaptureError("capture_unsafe", "Capture root is not a directory")
+    shutil.rmtree(root)
+    return True

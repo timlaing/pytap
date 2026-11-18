@@ -5,22 +5,21 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_SERIAL_PORT, DOMAIN
-from .coordinator import PyTapDataUpdateCoordinator
+from .const import CONF_SERIAL_PORT
+from .coordinator import PyTapConfigEntry
 
 TO_REDACT = {CONF_HOST, CONF_SERIAL_PORT, "title"}
 
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: PyTapConfigEntry,
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    coordinator: PyTapDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
 
     diagnostics_data = coordinator.get_diagnostics_data()
 

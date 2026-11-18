@@ -42,7 +42,8 @@ def _coordinator(hass, **kwargs):
     entry = _entry(hass, **kwargs)
     coordinator = PyTapDataUpdateCoordinator(hass, entry)
     coordinator._schedule_save = MagicMock()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
+    entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
     return entry, coordinator
 
 
@@ -112,14 +113,14 @@ def test_infrastructure_admits_all_modules_once_without_entry_writes(hass):
     assert coordinator.modules[0]["name"] == f"Optimizer {BARCODE}"
     assert coordinator.modules[0]["string"] == "Discovered"
     assert coordinator.modules[0]["peak_power"] == 0
-    assert coordinator.data["nodes"][BARCODE]["node_id"] == 1
+    assert coordinator._state["nodes"][BARCODE]["node_id"] == 1
 
 
 def test_first_power_reading_is_not_dropped_and_rating_is_unknown(hass):
     _, coordinator = _coordinator(hass)
     assert coordinator._process_event(_power())
     assert coordinator.module_count == 1
-    node = coordinator.data["nodes"][BARCODE]
+    node = coordinator._state["nodes"][BARCODE]
     assert node["power"] == 120
     assert node["readings_today"] == 1
     assert node["performance"] is None
@@ -140,8 +141,8 @@ def test_manual_mode_only_records_unconfigured_barcodes(hass):
     coordinator._process_event(_infra(BARCODE))
     coordinator._process_event(_power())
     assert coordinator.modules == []
-    assert coordinator.data["nodes"] == {}
-    assert BARCODE in coordinator.data["discovered_barcodes"]
+    assert coordinator._state["nodes"] == {}
+    assert BARCODE in coordinator._state["discovered_barcodes"]
 
 
 async def test_auto_modules_and_energy_restore_when_discovery_disabled(hass):
@@ -158,8 +159,8 @@ async def test_auto_modules_and_energy_restore_when_discovery_disabled(hass):
     restored._store.async_load = AsyncMock(return_value=saved)
     await restored._async_load_coordinator_state()
     assert restored.module_count == 1
-    assert restored.data["nodes"][BARCODE]["total_energy_wh"] == 1234
-    assert restored.data["nodes"][BARCODE]["power"] == 120
+    assert restored._state["nodes"][BARCODE]["total_energy_wh"] == 1234
+    assert restored._state["nodes"][BARCODE]["power"] == 120
     restored._process_event(_infra(BARCODE, OTHER))
     assert restored.module_count == 1
 
@@ -174,7 +175,7 @@ async def test_enabling_discovery_admits_previously_logged_modules(hass):
     )
     await coordinator._async_load_coordinator_state()
     assert coordinator.module_count == 1
-    assert coordinator.data["nodes"][BARCODE]["node_id"] == 5
+    assert coordinator._state["nodes"][BARCODE]["node_id"] == 5
 
 
 async def test_options_edit_metadata_merges_late_discoveries(hass):
@@ -198,7 +199,7 @@ async def test_options_edit_metadata_merges_late_discoveries(hass):
     await restored._async_load_coordinator_state()
     assert next(m for m in restored.modules if m["barcode"] == BARCODE) == MODULE
     restored._process_event(_power())
-    assert restored.data["nodes"][BARCODE]["performance"] == 24
+    assert restored._state["nodes"][BARCODE]["performance"] == 24
 
 
 async def test_removed_module_is_excluded_until_explicitly_added(hass):
@@ -217,8 +218,8 @@ async def test_removed_module_is_excluded_until_explicitly_added(hass):
     await restored._async_load_coordinator_state()
     restored._process_event(_power())
     assert restored.module_count == 0
-    assert BARCODE not in restored.data["nodes"]
-    hass.data[DOMAIN][entry.entry_id] = restored
+    assert BARCODE not in restored._state["nodes"]
+    entry.runtime_data = restored
     flow = PyTapOptionsFlow(entry)
     flow.hass = hass
     await flow.async_step_init()
@@ -303,7 +304,7 @@ async def test_live_discovery_creates_entities_and_updates_aggregates(hass: Home
     with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=no_network):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator = entry.runtime_data
         registry = er.async_get(hass)
         status_id = registry.async_get_entity_id(
             "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_module_discovery"
@@ -311,7 +312,7 @@ async def test_live_discovery_creates_entities_and_updates_aggregates(hass: Home
         assert hass.states.get(status_id).state == "waiting_for_modules"
         for barcode, power in [(BARCODE, 120), (OTHER, 150)]:
             await hass.async_add_executor_job(coordinator._process_event, _power(barcode, power))
-            coordinator.async_set_updated_data({**coordinator.data, "nodes": dict(coordinator.data["nodes"])})
+            coordinator.async_set_updated_data(coordinator._snapshot())
             await hass.async_block_till_done()
         assert hass.states.get(status_id).state == "modules_discovered"
         assert hass.states.get(status_id).attributes["module_count"] == 2
@@ -329,7 +330,7 @@ async def test_live_discovery_creates_entities_and_updates_aggregates(hass: Home
         count = len(er.async_entries_for_config_entry(registry, entry.entry_id))
         assert count == 41  # 2 × (13 sensors + 3 binary) + 4 string + 4 installation + 1 status.
         coordinator._process_event(_infra(BARCODE, OTHER))
-        coordinator.async_set_updated_data(dict(coordinator.data))
+        coordinator.async_set_updated_data(coordinator._snapshot())
         await hass.async_block_till_done()
         assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == count
         assert await hass.config_entries.async_unload(entry.entry_id)
@@ -344,10 +345,10 @@ async def test_unknown_rating_without_power_blocks_aggregate_percentage(hass):
     with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=no_network):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator = entry.runtime_data
         coordinator._process_event(_power())
         coordinator._process_event(_infra(BARCODE, OTHER))  # OTHER has no power or rating yet.
-        coordinator.async_set_updated_data(dict(coordinator.data))
+        coordinator.async_set_updated_data(coordinator._snapshot())
         await hass.async_block_till_done()
         registry = er.async_get(hass)
         aggregate_id = registry.async_get_entity_id(
@@ -366,7 +367,7 @@ async def test_discovery_policy_options_rebuild_coordinator(hass):
     with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=no_network):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-        old = hass.data[DOMAIN][entry.entry_id]
+        old = entry.runtime_data
         old._process_event(_infra(BARCODE, OTHER))
         flow = PyTapOptionsFlow(entry)
         flow.hass = hass
@@ -374,7 +375,7 @@ async def test_discovery_policy_options_rebuild_coordinator(hass):
         await flow.async_step_change_discovery({CONF_AUTO_DISCOVERY: True})
         await flow.async_step_done()
         await hass.async_block_till_done()
-        new = hass.data[DOMAIN][entry.entry_id]
+        new = entry.runtime_data
         assert new is not old
         assert new.auto_discovery is True
         assert {m["barcode"] for m in new.modules} == {BARCODE, OTHER}
@@ -385,7 +386,7 @@ async def test_discovery_policy_options_rebuild_coordinator(hass):
         await flow.async_step_remove_module({"remove_barcode": OTHER})
         await flow.async_step_done()
         await hass.async_block_till_done()
-        newest = hass.data[DOMAIN][entry.entry_id]
+        newest = entry.runtime_data
         assert newest is not new
         newest._process_event(_infra(BARCODE, OTHER))
         assert {m["barcode"] for m in newest.modules} == {BARCODE}

@@ -35,6 +35,7 @@ def main() -> int:
             pass
         args.output.mkdir(mode=0o700)
         counts: dict[str, int] = {}
+        live_drops: dict[str, int] = {}
         scanner = FrameScanner()
         with (
             private_output(args.output / "chunks.jsonl") as indexes,
@@ -43,6 +44,9 @@ def main() -> int:
 
             def write_frame(frame):
                 counts[frame["kind"]] = counts.get(frame["kind"], 0) + 1
+                if frame.get("live_parser_would_drop"):
+                    reason = frame["live_parser_drop_reason"]
+                    live_drops[reason] = live_drops.get(reason, 0) + 1
                 frames.write(json.dumps(frame, separators=(",", ":")) + "\n")
 
             for chunk in iter_capture(args.capture, allow_incomplete=args.allow_incomplete):
@@ -80,6 +84,7 @@ def main() -> int:
                     "dropped_bytes": manifest["dropped_bytes"],
                     "dropped_records": manifest["dropped_records"],
                     "records": counts,
+                    "frames_live_parser_would_drop": live_drops,
                 },
                 summary,
                 indent=2,

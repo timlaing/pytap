@@ -4,7 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from homeassistant.core import Context
 from homeassistant.exceptions import ServiceValidationError, Unauthorized
@@ -22,15 +22,15 @@ async def capture_entry(hass, tmp_path):
     )
     entry.add_to_hass(hass)
 
-    def no_network(self):
-        pass
+    def idle_listener(self):
+        # Model an offline/retrying listener without a network dependency: it
+        # runs until told to stop, like the real worker.
+        self._stop_event.wait()
 
-    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=no_network):
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=idle_listener):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    coordinator = hass.data[DOMAIN][entry.entry_id]
-    # Model an offline/retrying listener while avoiding a network dependency.
-    coordinator._stop_event.clear()
+    coordinator = entry.runtime_data
     coordinator._capture_root = tmp_path / "captures" / entry.entry_id
     yield entry, coordinator
     await coordinator.async_stop_capture()
@@ -265,3 +265,169 @@ async def test_capture_marker_failure_cannot_prevent_port_release(hass, capture_
             await coordinator._async_listen()
     source.close.assert_called_once()
     assert coordinator._source is None
+
+
+_ALL_SERVICES = (
+    "start_capture",
+    "stop_capture",
+    "capture_status",
+    "list_captures",
+    "export_capture",
+    "delete_capture",
+)
+
+
+@pytest.mark.parametrize("service", _ALL_SERVICES)
+async def test_non_admin_is_rejected_for_every_capture_service(
+    hass, capture_entry, hass_read_only_user, service
+):
+    entry, coordinator = capture_entry
+    data = {"config_entry_id": entry.entry_id}
+    if service == "delete_capture":
+        data["capture_id"] = "20260101T000000Z_aaaaaaaaaaaa"
+    with pytest.raises(Unauthorized):
+        await hass.services.async_call(
+            DOMAIN, service, data, context=Context(user_id=hass_read_only_user.id), blocking=True
+        )
+    assert coordinator.capture_status == {"state": "idle"}
+
+
+async def _error_key(hass, service, entry, **data):
+    with pytest.raises(ServiceValidationError) as err:
+        await _call(hass, service, entry, **data)
+    assert err.value.translation_domain == DOMAIN
+    return err.value.translation_key, err.value.translation_placeholders
+
+
+async def test_service_errors_are_translated(hass, capture_entry):
+    entry, coordinator = capture_entry
+    started = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    assert await _error_key(hass, "start_capture", entry) == ("capture_busy", {})
+    assert (await _error_key(hass, "export_capture", entry))[0] == "stop_before_export"
+    key, _ = await _error_key(hass, "delete_capture", entry, capture_id=started["capture_id"])
+    assert key == "capture_active"
+    await _call(hass, "stop_capture", entry)
+    assert (await _error_key(hass, "export_capture", entry, capture_id="../x"))[0] == "invalid_capture_id"
+    missing = "20260101T000000Z_aaaaaaaaaaaa"
+    assert await _error_key(hass, "capture_status", entry, capture_id=missing) == (
+        "capture_not_found",
+        {"capture_id": missing},
+    )
+    with pytest.raises(ValueError) as err:
+        await coordinator.async_start_capture(duration_minutes=0)
+    assert err.value.translation_key == "invalid_duration"
+    coordinator._capture = None
+    assert (await _error_key(hass, "export_capture", entry))[0] == "capture_id_required"
+    coordinator._stop_event.set()
+    assert (await _error_key(hass, "start_capture", entry))[0] == "listener_not_running"
+
+
+async def test_unknown_errors_hide_details_behind_a_translated_message(hass, capture_entry):
+    entry, _ = capture_entry
+    with patch(
+        "custom_components.pytap.coordinator.list_captures", side_effect=OSError("/private/secret path")
+    ):
+        assert await _error_key(hass, "list_captures", entry) == ("capture_failed", {"error": "OSError"})
+
+
+async def test_unloaded_entry_error_is_translated(hass):
+    from custom_components.pytap import async_setup
+
+    await async_setup(hass, {})
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(DOMAIN, "list_captures", {"config_entry_id": "missing"}, blocking=True)
+    assert err.value.translation_key == "capture_entry_not_loaded"
+
+
+async def test_export_budget_is_enforced(hass, capture_entry):
+    entry, coordinator = capture_entry
+    await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    await _call(hass, "stop_capture", entry)
+    with (coordinator._capture_root / "filler").open("wb") as filler:
+        filler.truncate(16 * 1024 * 1024)  # Sparse; still counted by apparent size.
+    key, placeholders = await _error_key(hass, "export_capture", entry, max_storage_mib=16)
+    assert key == "export_budget_exceeded" and placeholders["available_mib"] == "0"
+    assert not list(coordinator._capture_root.glob("*.zip"))
+    assert Path((await _call(hass, "export_capture", entry, max_storage_mib=64))["archive"]).is_file()
+
+
+async def test_export_does_not_hold_the_capture_lock(hass, capture_entry):
+    entry, coordinator = capture_entry
+    started = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    await _call(hass, "stop_capture", entry)
+    entered, release = asyncio.Event(), threading.Event()
+
+    def delayed_export(*args, **kwargs):
+        hass.loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        return Path("private.zip")
+
+    with patch("custom_components.pytap.coordinator.export_archive", new=delayed_export):
+        task = asyncio.create_task(coordinator.async_export_capture())
+        await entered.wait()
+        try:
+            assert not coordinator._capture_lock.locked()
+            stopped = await asyncio.wait_for(coordinator.async_stop_capture(), 1)
+            assert stopped["state"] == "stopped"
+            for action in (
+                coordinator.async_start_capture(1, 16),
+                coordinator.async_export_capture(),
+                coordinator.async_delete_capture(started["capture_id"]),
+            ):
+                with pytest.raises(ValueError) as err:
+                    await asyncio.wait_for(action, 1)
+                assert err.value.translation_key == "capture_busy"
+            unload = asyncio.create_task(coordinator.async_stop_listener())
+            await asyncio.sleep(0.05)
+        finally:
+            release.set()
+        assert (await task)["archive"] == "private.zip"
+        assert await unload
+
+
+async def test_delete_capture_service(hass, capture_entry):
+    entry, coordinator = capture_entry
+    first = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    await _call(hass, "stop_capture", entry)
+    archive = Path((await _call(hass, "export_capture", entry))["archive"])
+    second = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    await _call(hass, "stop_capture", entry)
+    result = await _call(hass, "delete_capture", entry, capture_id=first["capture_id"])
+    assert result == {"capture_id": first["capture_id"], "deleted_archives": 1, "deleted_bytes": ANY}
+    assert not Path(first["directory"]).exists() and not archive.exists()
+    listed = (await _call(hass, "list_captures", entry))["captures"]
+    assert [c["capture_id"] for c in listed] == [second["capture_id"]]
+    await _call(hass, "delete_capture", entry, capture_id=second["capture_id"])
+    assert coordinator.capture_status == {"state": "idle"}
+    for capture_id in ("../../config", "..", first["capture_id"]):
+        key, _ = await _error_key(hass, "delete_capture", entry, capture_id=capture_id)
+        assert key in ("invalid_capture_id", "capture_not_found")
+
+
+async def test_diagnostics_capture_status_has_no_directory(hass, capture_entry):
+    entry, coordinator = capture_entry
+    started = await _call(hass, "start_capture", entry, duration_minutes=1, max_storage_mib=16)
+    assert "directory" in started
+    assert "directory" not in coordinator.capture_status
+    assert "directory" not in coordinator.get_diagnostics_data()["packet_capture"]
+    assert "directory" in await _call(hass, "capture_status", entry)
+    stopped = await _call(hass, "stop_capture", entry)
+    assert str(coordinator._capture_root) not in json.dumps(
+        coordinator.get_diagnostics_data()["packet_capture"]
+    )
+    manifest = (Path(stopped["directory"]) / "manifest.json").read_text()
+    assert str(coordinator._capture_root) not in manifest
+    coordinator._capture = None
+    stored = await _call(hass, "capture_status", entry, capture_id=started["capture_id"])
+    assert stored["directory"] == stopped["directory"] and "segments" not in stored
+
+
+async def test_remove_captures_for_removed_entry(hass, tmp_path):
+    from custom_components.pytap.capture_services import async_remove_captures
+
+    root = tmp_path / "pytap_captures" / "entry"
+    (root / "20260101T000000Z_aaaaaaaaaaaa").mkdir(parents=True)
+    with patch("custom_components.pytap.capture_services.capture_root", return_value=root):
+        await async_remove_captures(hass, "entry")
+        assert not root.exists()
+        await async_remove_captures(hass, "entry")  # Already gone: no error.

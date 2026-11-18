@@ -1197,3 +1197,58 @@ def test_g_firmware_receive_response_still_works():
     assert len(power_events) == 1
     assert power_events[0].gateway_id == gw_id
     assert power_events[0].node_id == 22
+
+
+# -----------------------------------------------------------------------
+#  Invalid slot counters and undocumented status bytes
+# -----------------------------------------------------------------------
+
+
+def _h_status(packet_number_lo: int, slot: int) -> bytes:
+    return bytes([0x01, 0x1E, 0x02, packet_number_lo]) + slot.to_bytes(2, "big")
+
+
+def _power_packet_with(node_id: int, *, slot: int = 0x64D4, unknown: bytes = b"\x96\x93\x00") -> bytes:
+    packet = bytearray(_build_power_report_packet(node_id))
+    packet[7 + 7 : 7 + 10] = unknown
+    packet[7 + 10 : 7 + 12] = slot.to_bytes(2, "big")
+    return bytes(packet)
+
+
+def test_invalid_header_slot_skips_clock_but_keeps_reports():
+    """A corrupt header counter must not drop valid reports in the same frame."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    parser.feed(_build_receive_response(gw_id, _h_status(0x4A, 0xD457), b""))  # Establish the clock.
+
+    parser.feed(_build_receive_request(gw_id, 0x004A))
+    frame = _build_receive_response(gw_id, _h_status(0x4B, 0xFFFF), _power_packet_with(27))
+    power_events = [e for e in parser.feed(frame) if e.event_type == "power_report"]
+
+    assert len(power_events) == 1
+    assert parser.counters["invalid_slots"] == 1
+    assert parser._rx_packet_numbers[gw_id] == 0x004B
+
+
+def test_invalid_report_slot_is_counted_and_dropped():
+    """A report whose own slot counter is invalid has no valid timestamp."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    frame = _build_receive_response(gw_id, _h_status(0x4A, 0xD457), _power_packet_with(27, slot=0x3000))
+    assert [e for e in parser.feed(frame) if e.event_type == "power_report"] == []
+    assert parser.counters["invalid_slots"] == 1
+
+
+def test_parser_fills_status_fields_on_power_events():
+    """Byte 7 bit 7 and byte 9 reach PowerReportEvent through Parser.feed."""
+    parser = Parser()
+    gw_id = 0x1203
+    parser.feed(_build_receive_request(gw_id, 0x0049))
+    packet = _power_packet_with(27, unknown=b"\x93\x00\xe4")
+    frame = _build_receive_response(gw_id, _h_status(0x4A, 0xD457), packet)
+    (event,) = [e for e in parser.feed(frame) if e.event_type == "power_report"]
+    assert event.high_output_mode is True
+    assert event.status_code == 0xE4
+    assert event.low_voltage_flag is True
