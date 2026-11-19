@@ -22,6 +22,7 @@
 
 ### Changed
 
+- Performance entities (per panel, string and installation) are disabled while any panel they cover has no rated power, and re-enabled once every rating is set. Entities you disabled yourself are left alone.
 - String and installation energy totals now add up each member's increase since it was last seen (restored across restarts), so moving a panel between strings or discovering a new panel no longer adds its lifetime energy. The daily aggregate resets at local midnight and reports the start of its own cycle as `last_reset`.
 - Packet captures are stored in the Home Assistant configuration directory (`pytap_captures/<entry_id>`), so they are included in Home Assistant backups, and are deleted when the PyTap entry is removed.
 - Capture manifests are rewritten only when they change (at most every 10 s while recording, plus at rotation/stop), after the data they describe has been flushed to disk. `events.jsonl` now has a checksum in the manifest.

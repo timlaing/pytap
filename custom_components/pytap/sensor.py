@@ -31,6 +31,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import ExtraStoredData
@@ -366,6 +367,7 @@ async def async_setup_entry(
             sensor.set_barcodes(all_barcodes)
         if entities:
             async_add_entities(entities)
+        _sync_performance_entities(hass, entry.entry_id, coordinator, string_to_barcodes, all_barcodes)
 
     # Register before creating entities so aggregate membership is refreshed
     # before their own coordinator callbacks consume each discovery update.
@@ -373,6 +375,51 @@ async def async_setup_entry(
     add_discovered_entities()
     if coordinator.auto_discovery:
         async_add_entities([PyTapDiscoverySensor(coordinator, entry, installation_device)])
+
+
+def _performance_unique_ids(
+    entry_id: str,
+    coordinator: PyTapDataUpdateCoordinator,
+    string_to_barcodes: dict[str, list[str]],
+    all_barcodes: list[str],
+) -> dict[str, bool]:
+    """Map each performance entity's unique ID to whether it has ratings to work from."""
+
+    def rated(barcodes: list[str]) -> bool:
+        return all(coordinator.module_peak_power(barcode) > 0 for barcode in barcodes)
+
+    wanted = {f"{DOMAIN}_{barcode}_performance": rated([barcode]) for barcode in all_barcodes}
+    for string_name, barcodes in string_to_barcodes.items():
+        wanted[f"{DOMAIN}_{entry_id}_string_{string_name}_performance"] = rated(barcodes)
+    if all_barcodes:
+        wanted[f"{DOMAIN}_{entry_id}_installation_performance"] = rated(all_barcodes)
+    return wanted
+
+
+@callback
+def _sync_performance_entities(
+    hass: HomeAssistant,
+    entry_id: str,
+    coordinator: PyTapDataUpdateCoordinator,
+    string_to_barcodes: dict[str, list[str]],
+    all_barcodes: list[str],
+) -> None:
+    """Disable performance entities without a panel rating; re-enable them once rated.
+
+    Only entities that are enabled, or that this integration disabled, are
+    changed; a user's own choice to disable an entity is left alone.
+    """
+    registry = er.async_get(hass)
+    for unique_id, has_rating in _performance_unique_ids(
+        entry_id, coordinator, string_to_barcodes, all_barcodes
+    ).items():
+        if (entity_id := registry.async_get_entity_id("sensor", DOMAIN, unique_id)) is None:
+            continue
+        disabled_by = registry.entities[entity_id].disabled_by
+        if not has_rating and disabled_by is None:
+            registry.async_update_entity(entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION)
+        elif has_rating and disabled_by is er.RegistryEntryDisabler.INTEGRATION:
+            registry.async_update_entity(entity_id, disabled_by=None)
 
 
 class PyTapDiscoverySensor(CoordinatorEntity[PyTapDataUpdateCoordinator], SensorEntity):
@@ -427,6 +474,9 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         # Unique ID: domain + barcode + sensor key
         self._attr_unique_id = f"{DOMAIN}_{self._barcode}_{description.key}"
         self._attr_device_info = module_device_info(module_config)
+        if description.key == "performance" and self._module_peak_power <= 0:
+            # No panel rating: nothing to compute until the user sets one.
+            self._attr_entity_registry_enabled_default = False
         self._restored_native_value = False
         self._last_written: tuple[Any, ...] | None = None
 
@@ -618,6 +668,10 @@ class PyTapAggregateSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], Restor
         self._barcodes = barcodes
         self._attr_unique_id = unique_id
         self._attr_device_info = device_info
+        if description.key == "performance" and any(
+            coordinator.module_peak_power(barcode) <= 0 for barcode in barcodes
+        ):
+            self._attr_entity_registry_enabled_default = False
         self._restored_native_value = False
         self._energy_total: float | None = None
         self._baselines: dict[str, float] = {}

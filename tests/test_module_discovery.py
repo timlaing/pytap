@@ -266,7 +266,9 @@ async def test_cleared_rating_cannot_restore_an_old_percentage(hass):
             f"{DOMAIN}_{entry.entry_id}_installation_performance",
         ):
             entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
-            assert hass.states.get(entity_id).state in ("unknown", "unavailable")
+            # No rating: the entity is disabled, so no old percentage can appear.
+            assert registry.async_get(entity_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
+            assert hass.states.get(entity_id) is None
         assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -326,7 +328,7 @@ async def test_live_discovery_creates_entities_and_updates_aggregates(hass: Home
         performance_id = registry.async_get_entity_id(
             "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_performance"
         )
-        assert hass.states.get(performance_id).state == "unknown"
+        assert registry.async_get(performance_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
         count = len(er.async_entries_for_config_entry(registry, entry.entry_id))
         assert count == 41  # 2 × (13 sensors + 3 binary) + 4 string + 4 installation + 1 status.
         coordinator._process_event(_infra(BARCODE, OTHER))
@@ -354,7 +356,34 @@ async def test_unknown_rating_without_power_blocks_aggregate_percentage(hass):
         aggregate_id = registry.async_get_entity_id(
             "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_performance"
         )
-        assert hass.states.get(aggregate_id).state == "unknown"
+        # OTHER joined unrated: the aggregate percentage is disabled, not guessed.
+        assert registry.async_get(aggregate_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_performance_reenabled_once_rated_but_user_choice_kept(hass):
+    entry = _entry(hass, modules=[{**MODULE, "peak_power": 0}])
+
+    def no_network(self):
+        pass
+
+    registry = er.async_get(hass)
+    with patch("custom_components.pytap.coordinator.PyTapDataUpdateCoordinator._listen", new=no_network):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        panel = registry.async_get_entity_id("sensor", DOMAIN, f"{DOMAIN}_{BARCODE}_performance")
+        string = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_string_East_performance"
+        )
+        assert registry.async_get(panel).disabled_by is er.RegistryEntryDisabler.INTEGRATION
+        registry.async_update_entity(string, disabled_by=er.RegistryEntryDisabler.USER)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "modules": [MODULE]})
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert registry.async_get(panel).disabled_by is None
+        assert registry.async_get(string).disabled_by is er.RegistryEntryDisabler.USER
         assert await hass.config_entries.async_unload(entry.entry_id)
 
 
